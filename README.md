@@ -39,4 +39,4 @@ Automated checks cover controlled models, real SQLite, and local HTTP contracts.
 
 ## License and attribution
 
-Project additions use the [MIT License](LICENSE). WeKnora and dependency copyrights and license texts are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Project additions use the [MIT License](LICENSE). The WeKnora copyright and license text are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -39,4 +39,4 @@ go test -race ./...
 
 ## 许可与来源
 
-本项目新增部分采用 [MIT 许可](LICENSE)。WeKnora 及依赖的版权与许可原文集中保存在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目新增部分采用 [MIT 许可](LICENSE)。WeKnora 的版权与许可原文集中保存在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
