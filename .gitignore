@@ -1,0 +1,9 @@
+.DS_Store
+.scratch/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+coverage.out
+go.work
+go.work.sum
