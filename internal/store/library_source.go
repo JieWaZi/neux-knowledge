@@ -218,9 +218,14 @@ func (s *Store) ImportSource(ctx context.Context, in types.ImportSourceInput) (*
 		return nil, err
 	}
 	return s.mutate(ctx, in.RequestID, "source.import", in.LibraryID, in, func(tx *gorm.DB) (*types.Receipt, error) {
-		if _, err := getLibrary(tx, in.LibraryID, true); err != nil {
+		library, err := getLibrary(tx, in.LibraryID, true)
+		if err != nil {
 			return nil, err
 		}
+		if in.ExpectedPolicyVersion > 0 && library.PolicyVersion != in.ExpectedPolicyVersion {
+			return nil, fail(types.ErrScopeViolation, "source.import", "policy changed")
+		}
+
 		sourceID := in.SourceID
 		version := int64(1)
 		if sourceID == "" {

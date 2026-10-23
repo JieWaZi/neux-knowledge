@@ -6,6 +6,10 @@ WeKnora official website: [weknora.weixin.qq.com](https://weknora.weixin.qq.com/
 
 Project additions are covered by the root MIT LICENSE. The WeKnora copyright and permission notice below applies to the corresponding reused code.
 
+## Additional reuse in API integration
+
+From Tencent/WeKnora commit `8776a2d92d11ad3e76865d51cf3192e37e2a9976`, graph subset selection, graph sorting/BFS and their 13 tests were copied from `internal/handler/wiki_page.go` and the corresponding graph tests into `internal/wiki/graph.go` and `graph_test.go`. The core graph projection, SQLite metadata read port, service detection and HTTP integration/native-upload clients are local adaptations. The original MIT notice below is retained. Tests of remote request/response fixtures are newly written contract tests, not copied end-to-end service tests.
+
 ## Tencent WeKnora
 
 The following is the WeKnora copyright and MIT permission notice, excerpted from the upstream license.

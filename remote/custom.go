@@ -25,8 +25,10 @@ type ResourceRef struct {
 
 // Custom stores only an HTTP connection and resource reference, with no local model, reader, or index.
 type Custom struct {
-	transport *WeKnora    // Reuse bounded HTTP transport configuration with redirects disabled.
-	ref       ResourceRef // Complete frozen resource target.
+	// integration 仅选择新公开合同，不在页面散落后端分支。
+	integration bool
+	transport   *WeKnora    // Reuse bounded HTTP transport configuration with redirects disabled.
+	ref         ResourceRef // Complete frozen resource target.
 }
 
 // OutcomeUnknownError means a write may have committed; callers must query the original receipt rather than retry with a new request identity.
@@ -44,6 +46,9 @@ func NewCustom(o Options, ref ResourceRef) (*Custom, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 存量 custom 的完整部署路径保持原样，不能按新 API 后缀自动改指目标。
+	original, _ := url.Parse(o.BaseURL)
+	transport.base = original
 	return &Custom{transport: transport, ref: ref}, nil
 }
 func (c *Custom) Resource() ResourceRef { return c.ref }
@@ -93,8 +98,15 @@ func (c *Custom) target(library string) error {
 	return nil
 }
 func (c *Custom) request(ctx context.Context, method, path string, q url.Values, in any, requestID string) ([]byte, http.Header, error) {
+	if c.integration {
+		return c.requestIntegration(ctx, method, path, q, in, requestID)
+	}
 	var reader io.Reader
-	if in != nil {
+	contentType := "application/json"
+	if raw, ok := in.(rawPayload); ok {
+		reader = raw.Reader
+		contentType = raw.ContentType
+	} else if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
 			return nil, nil, &Error{Code: "invalid_request"}
@@ -109,10 +121,17 @@ func (c *Custom) request(ctx context.Context, method, path string, q url.Values,
 	if err != nil {
 		return nil, nil, &Error{Code: "invalid_request"}
 	}
-	req.Header.Set("Authorization", "Bearer "+c.transport.token)
+	if c.transport.authMode == "api_key" {
+		req.Header.Set("X-API-Key", c.transport.token)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+c.transport.token)
+	}
+	if requestID != "" {
+		req.Header.Set("Idempotency-Key", requestID)
+	}
 	req.Header.Set("Accept", "application/json, application/octet-stream")
 	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 	}
 	// Automatic retries are forbidden because the server may have committed before the response was lost; callers may only query the original requestId.
 	resp, err := c.transport.http.Do(req)
@@ -551,7 +570,7 @@ type CustomCapabilityStatus struct {
 
 func (c *Custom) Capabilities(ctx context.Context) (*CustomCapabilities, error) {
 	v, err := customGet[CustomCapabilities](ctx, c, "/capabilities", nil, "profile", "operations", "details")
-	if err == nil && v.Profile != "neux-knowledge-v1" {
+	if err == nil && ((!c.integration && v.Profile != "neux-knowledge-v1") || (c.integration && v.Profile != "neuxally-integration-v1")) {
 		return nil, protocolError()
 	}
 	return v, err

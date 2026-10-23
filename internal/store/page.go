@@ -531,6 +531,9 @@ func (s *Store) WriteTheme(ctx context.Context, in types.WriteThemeInput) (*type
 		if err != nil {
 			return nil, err
 		}
+		if in.ExpectedPolicyVersion > 0 && l.PolicyVersion != in.ExpectedPolicyVersion {
+			return nil, fail(types.ErrScopeViolation, "theme.write", "policy changed")
+		}
 		if l.StructureVersion != in.StructureVersion {
 			return nil, fail(types.ErrVersionConflict, "theme.write", "structure changed")
 		}

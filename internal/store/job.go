@@ -435,3 +435,21 @@ func (s *Store) GetActiveJob(ctx context.Context, libraryID string) (result *typ
 	})
 	return
 }
+
+// ListJobsForActor 只查询同一库的原作业表，JSON 身份来自受信 ActivityActor，不读取宿主配置副本。
+func (s *Store) ListJobsForActor(ctx context.Context, lib, actor string, offset, limit int) (items []*types.Job, total int64, err error) {
+	if lib == "" || actor == "" || offset < 0 || limit < 1 || limit > 100 {
+		return nil, 0, fail(types.ErrInvalid, "job.list", "explicit actor and pagination required")
+	}
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		if _, e := getLibrary(tx, lib, false); e != nil {
+			return e
+		}
+		query := tx.Model(&types.Job{}).Where("library_id = ? AND json_extract(activity_actor, '$.userId') = ?", lib, actor)
+		if e := query.Count(&total).Error; e != nil {
+			return e
+		}
+		return query.Order("created_at DESC, id ASC").Offset(offset).Limit(limit).Find(&items).Error
+	})
+	return
+}

@@ -239,9 +239,14 @@ func (s *Store) prepareImport(ctx context.Context, in types.ImportSourceInput) (
 			}
 			intent = &pending
 		}
-		if _, e = getLibrary(tx, in.LibraryID, true); e != nil {
+		library, e := getLibrary(tx, in.LibraryID, true)
+		if e != nil {
 			return e
 		}
+		if in.ExpectedPolicyVersion > 0 && library.PolicyVersion != in.ExpectedPolicyVersion {
+			return fail(types.ErrScopeViolation, "source.import", "policy changed")
+		}
+
 		if in.SourceID != "" {
 			var tombstones int64
 			if e = tx.Model(&types.SourcePurgeRecord{}).Where("source_id = ?", in.SourceID).Count(&tombstones).Error; e != nil {

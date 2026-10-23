@@ -46,3 +46,8 @@ func (e *Engine) FailJob(ctx context.Context, in FailJobInput) (*Receipt, error)
 func (e *Engine) GetActiveJob(ctx context.Context, libraryID string) (*Job, error) {
 	return e.store.GetActiveJob(ctx, libraryID)
 }
+
+// ListJobsForActor 在服务端计数和分页前按真实接纳主体过滤，不返回其他 Key 的过程状态。
+func (e *Engine) ListJobsForActor(ctx context.Context, libraryID, actorID string, offset, limit int) ([]*Job, int64, error) {
+	return e.store.ListJobsForActor(ctx, libraryID, actorID, offset, limit)
+}

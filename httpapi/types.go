@@ -3,6 +3,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/JieWaZi/neux-knowledge/core"
 )
 
@@ -10,10 +11,16 @@ const BasePath = "/api/knowledge/v1"
 
 // Authorization freezes the accepted identity and provides a reacquirable revocation guard for actual publication.
 type Authorization struct {
-	Subject      string                                // Authenticated principal, not a client-reported identity.
-	Permission   core.PermissionSnapshot               // Actual library scope and permission generation verified by the server.
-	PublishGuard func(context.Context) (func(), error) // Recheck the policy under a read lock; release it after the publication transaction ends.
-	Recovery     RecoveryIdentity                      // Persistable original authorization identity without the token content.
+	// Subject 是已认证的调用主体。
+	Subject string
+	// Permission 是冻结的核心许可快照。
+	Permission core.PermissionSnapshot
+	// Recovery 是模块独立服务使用的恢复身份。
+	Recovery RecoveryIdentity
+	// RecoveryData 是宿主受信适配器生成的恢复信封，不接受请求正文提供。
+	RecoveryData json.RawMessage
+	// PublishGuard 在每次实际提交前重检调用授权。
+	PublishGuard func(context.Context) (func(), error)
 }
 
 // RecoveryIdentity is stored only by the host; recovery jobs do not accept this identity from clients.

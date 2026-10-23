@@ -69,6 +69,11 @@ func NewWeKnora(o Options) (*WeKnora, error) {
 	if err != nil || u == nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.TrimSpace(o.Token) == "" {
 		return nil, &Error{Code: "invalid_connection"}
 	}
+	// 标准接入接受完整 API 基址，内部路径仍统一从部署根拼接。
+	if strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/api/v1") {
+		u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/api/v1")
+		u.RawPath = ""
+	}
 	if o.AuthMode == "" {
 		o.AuthMode = "bearer"
 	}

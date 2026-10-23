@@ -37,3 +37,47 @@ func TestWritePageChecksExpectedPolicyInsideTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWriteThemeChecksExpectedPolicyInsideTransaction(t *testing.T) {
+	ctx := context.Background()
+	engine, _ := open(t)
+	defer engine.Close()
+	lib := library(t, engine, "theme-policy")
+	_, err := engine.UpdateLibrary(ctx, core.UpdateLibraryInput{RequestID: "revoke", LibraryID: lib.ID, ExpectedVersion: lib.Version, Name: lib.Name, PolicyVersion: lib.PolicyVersion + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.WriteTheme(ctx, core.WriteThemeInput{RequestID: "stale-theme", LibraryID: lib.ID, StructureVersion: lib.StructureVersion, ExpectedPolicyVersion: lib.PolicyVersion, Theme: core.Theme{Name: "不可提交", Manual: true}})
+	code(t, err, core.ErrScopeViolation)
+	themes, err := engine.ListThemes(ctx, lib.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, theme := range themes {
+		if theme.Name == "不可提交" {
+			t.Fatal("revoked theme committed")
+		}
+	}
+	if _, err := engine.GetReceipt(ctx, "stale-theme"); err == nil {
+		t.Fatal("rejected theme left receipt")
+	}
+}
+
+func TestImportSourceChecksExpectedPolicyInsideTransaction(t *testing.T) {
+	ctx := context.Background()
+	engine, _ := open(t)
+	defer engine.Close()
+	lib := library(t, engine, "source-policy")
+	if _, err := engine.UpdateLibrary(ctx, core.UpdateLibraryInput{RequestID: "changed", LibraryID: lib.ID, ExpectedVersion: lib.Version, Name: lib.Name, PolicyVersion: lib.PolicyVersion + 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := engine.ImportSource(ctx, core.ImportSourceInput{RequestID: "stale-source", LibraryID: lib.ID, ExpectedPolicyVersion: lib.PolicyVersion, Filename: "source.md", Bytes: []byte("不应提交")})
+	code(t, err, core.ErrScopeViolation)
+	_, total, err := engine.ListSources(ctx, lib.ID, 0, 10)
+	if err != nil || total != 0 {
+		t.Fatal("stale source committed", total, err)
+	}
+	if _, err := engine.GetReceipt(ctx, "stale-source"); err == nil {
+		t.Fatal("stale source received success receipt")
+	}
+}
