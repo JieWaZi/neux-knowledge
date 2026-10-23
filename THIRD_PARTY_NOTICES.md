@@ -10,6 +10,10 @@ Project additions are covered by the root MIT LICENSE. The WeKnora copyright and
 
 From Tencent/WeKnora commit `8776a2d92d11ad3e76865d51cf3192e37e2a9976`, graph subset selection, graph sorting/BFS and their 13 tests were copied from `internal/handler/wiki_page.go` and the corresponding graph tests into `internal/wiki/graph.go` and `graph_test.go`. The core graph projection, SQLite metadata read port, service detection and HTTP integration/native-upload clients are local adaptations. The original MIT notice below is retained. Tests of remote request/response fixtures are newly written contract tests, not copied end-to-end service tests.
 
+## SQLite retrieval reuse
+
+From Tencent/WeKnora commit `8776a2d92d11ad3e76865d51cf3192e37e2a9976`, the SQLite CJK bigram tokenizer and FTS5 query sanitizer are reused from `internal/application/repository/retriever/sqlite/repository.go`. FTS5/BM25 retrieval, pre-filtered sqlite-vec Top-K and normalized weighted RRF follow that repository and `internal/application/service/knowledgebase_search_fusion.go`, adapted to the core's source/version/authorization boundaries. The SQLite connection uses independent ncruces/go-sqlite3 and luist18/sqlite-vec-go bindings to retain CGO-free builds; no host memory module is used. The upstream MIT notice below remains applicable.
+
 ## Tencent WeKnora
 
 The following is the WeKnora copyright and MIT permission notice, excerpted from the upstream license.

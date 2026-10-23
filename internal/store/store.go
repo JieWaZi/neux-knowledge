@@ -6,6 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	_ "github.com/luist18/sqlite-vec-go"
+	sqlite3 "github.com/ncruces/go-sqlite3"
+	sqlitedriver "github.com/ncruces/go-sqlite3/driver"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +21,6 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
-	sqlitecodes "modernc.org/sqlite/lib"
 )
 
 // Store owns the knowledge database and managed source directory without starting background execution.
@@ -49,8 +52,27 @@ func Open(ctx context.Context, dbPath, rawDir string) (*Store, error) {
 	if err != nil {
 		return nil, wrap(types.ErrStorage, "open", err)
 	}
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{SkipDefaultTransaction: true, Logger: logger.Default.LogMode(logger.Silent)})
+	conn, err := sqlitedriver.Open((&url.URL{Scheme: "file", Path: dbPath}).String(), func(c *sqlite3.Conn) error {
+		// 还原 SQLite 原生零忙等待，由核心完整事务重试处理竞争。
+		if err := c.BusyTimeout(0); err != nil {
+			return err
+		}
+
+		return c.CreateFunction("neux_source_contains", 2, sqlite3.DETERMINISTIC|sqlite3.INNOCUOUS, func(ctx sqlite3.Context, args ...sqlite3.Value) {
+			if strings.Contains(strings.ToLower(args[0].Text()), strings.ToLower(args[1].Text())) {
+				ctx.ResultInt(1)
+			} else {
+				ctx.ResultInt(0)
+			}
+		})
+	})
 	if err != nil {
+		root.Close()
+		return nil, wrap(types.ErrDatabase, "open", err)
+	}
+	db, err := gorm.Open(sqlite.Dialector{Conn: conn}, &gorm.Config{SkipDefaultTransaction: true, Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		conn.Close()
 		root.Close()
 		return nil, wrap(types.ErrDatabase, "open", err)
 	}
@@ -114,7 +136,7 @@ func (s *Store) Close() error {
 }
 
 // currentSchemaVersion is the sole version of the current development schema; the core does not run historical upgrades.
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // schemaState identifies the current schema used by this database without recording a historical migration sequence.
 type schemaState struct {
@@ -139,7 +161,7 @@ var currentSchemaIndexes = map[string]string{
 func (s *Store) ensureSchema(ctx context.Context) error {
 	return s.transaction(ctx, func(tx *gorm.DB) error {
 		var tables []string
-		if err := tx.Raw("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").Scan(&tables).Error; err != nil {
+		if err := tx.Raw("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB 'knowledge_retrieval_*'").Scan(&tables).Error; err != nil {
 			return err
 		}
 		models := currentSchemaModels()
@@ -151,6 +173,9 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				if err := tx.Exec(ddl).Error; err != nil {
 					return err
 				}
+			}
+			if err := createDocumentRetrieval(tx); err != nil {
+				return err
 			}
 			return tx.Create(&schemaState{ID: 1, Version: currentSchemaVersion}).Error
 		}
@@ -204,7 +229,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				return fail(types.ErrDatabase, "schema.validate", "current schema index is missing")
 			}
 		}
-		return nil
+		return validateDocumentRetrieval(tx)
 	})
 }
 func fail(code types.ErrorCode, op, detail string) error {
@@ -217,17 +242,17 @@ func newID() string        { return strings.ReplaceAll(uuid.NewString(), "-", ""
 func digest(v any) string  { b, _ := json.Marshal(v); return hash(b) }
 func hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
-// sqlitePrimaryCode handles extended error codes from the pure-Go modernc/glebarez drivers.
+// sqlitePrimaryCode 提取知识模块无 CGO 驱动的主错误码。
 func sqlitePrimaryCode(err error) int {
-	var coded interface{ Code() int }
+	var coded interface{ Code() sqlite3.ErrorCode }
 	if errors.As(err, &coded) {
-		return coded.Code() & 0xff
+		return int(coded.Code())
 	}
 	return 0
 }
 func isBusy(err error) bool {
 	code := sqlitePrimaryCode(err)
-	return code == sqlitecodes.SQLITE_BUSY || code == sqlitecodes.SQLITE_LOCKED
+	return code == int(sqlite3.BUSY) || code == int(sqlite3.LOCKED)
 }
 
 func translate(op string, err error) error {
@@ -247,7 +272,7 @@ func translate(op string, err error) error {
 	if errors.Is(err, ErrWikiPageConflict) {
 		return wrap(types.ErrVersionConflict, op, err)
 	}
-	if sqlitePrimaryCode(err) == sqlitecodes.SQLITE_CONSTRAINT {
+	if sqlitePrimaryCode(err) == int(sqlite3.CONSTRAINT) {
 		return wrap(types.ErrVersionConflict, op, err)
 	}
 	if isBusy(err) {

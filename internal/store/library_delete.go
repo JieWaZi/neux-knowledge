@@ -123,7 +123,10 @@ func (s *Store) DeleteLibrary(ctx context.Context, in types.DeleteLibraryInput) 
 				return nil, err
 			}
 		}
-		for _, model := range []any{&types.WikiFinalizeOp{}, &types.OrganizeSourceWork{}, &types.EmbeddingChunkIndex{}, &types.Job{}, &types.SourceHead{}, &types.SourceVersion{}, &types.ImportBlobIntent{}, &types.SourcePurgeRecord{}, &types.SourceTombstone{}} {
+		if err = deleteDocumentChunks(tx, l.ID, ""); err != nil {
+			return nil, err
+		}
+		for _, model := range []any{&types.WikiFinalizeOp{}, &types.OrganizeSourceWork{}, &types.Job{}, &types.SourceHead{}, &types.SourceVersion{}, &types.ImportBlobIntent{}, &types.SourcePurgeRecord{}, &types.SourceTombstone{}} {
 			if err = tx.Unscoped().Where("library_id = ?", l.ID).Delete(model).Error; err != nil {
 				return nil, err
 			}

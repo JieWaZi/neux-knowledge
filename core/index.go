@@ -24,6 +24,16 @@ type DocumentEmbedder struct {
 // DocumentChunkHit exposes actual persisted chunks and retrieval scores.
 type DocumentChunkHit = types.DocumentChunkHit
 
+// MatchType 表示命中的实际召回算法。
+type MatchType = types.MatchType
+
+const (
+	// MatchTypeEmbedding 表示向量召回。
+	MatchTypeEmbedding = types.MatchTypeEmbedding
+	// MatchTypeKeywords 表示关键词召回。
+	MatchTypeKeywords = types.MatchTypeKeywords
+)
+
 // IndexedDocumentChunk exposes source chunk state without serializing credentials or vectors.
 type IndexedDocumentChunk = types.EmbeddingChunkIndex
 
@@ -207,7 +217,7 @@ func (e *Engine) ListDocumentChunks(ctx context.Context, libraryID, sourceID str
 	return e.store.ListDocumentChunks(ctx, libraryID, sourceID)
 }
 
-// SearchDocumentChunks performs actual vector or keyword retrieval; vector search does not fall back to LIKE.
+// SearchDocumentChunks 在指定知识库内执行 FTS5、向量或混合检索，错误不降级为空结果。
 func (e *Engine) SearchDocumentChunks(ctx context.Context, libraryID, query string, vector []float32, fingerprint string, limit int) ([]DocumentChunkHit, error) {
 	return e.store.SearchDocumentChunks(ctx, libraryID, query, vector, fingerprint, limit)
 }

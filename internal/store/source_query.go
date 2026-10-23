@@ -2,24 +2,12 @@ package store
 
 import (
 	"context"
-	"database/sql/driver"
 	"encoding/json"
 	"strings"
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
-	gosqlite "github.com/glebarez/go-sqlite"
 	"gorm.io/gorm"
 )
-
-// Register before the database connection opens; SQLite's built-in lower supports only ASCII and cannot reproduce frontend Unicode search semantics.
-var sourceContainsRegistration = gosqlite.RegisterDeterministicScalarFunction("neux_source_contains", 2, func(_ *gosqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	filename, _ := args[0].(string)
-	query, _ := args[1].(string)
-	if strings.Contains(strings.ToLower(filename), strings.ToLower(query)) {
-		return int64(1), nil
-	}
-	return int64(0), nil
-})
 
 // sourceActivity holds a lightweight state overlay for the current attempt without loading source contents.
 type sourceActivity struct {
@@ -102,9 +90,6 @@ func (s *Store) SourceActivity(ctx context.Context, libraryID string, sources []
 
 // ListSourcesQuery filters display state using single-table conditions; counts and pagination share a snapshot.
 func (s *Store) ListSourcesQuery(ctx context.Context, libraryID string, in types.SourceQuery) (items []*types.SourceVersion, total int64, err error) {
-	if sourceContainsRegistration != nil {
-		return nil, 0, sourceContainsRegistration
-	}
 	state := strings.TrimSpace(in.State)
 	if state == "" {
 		state = "all"

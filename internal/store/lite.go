@@ -328,7 +328,11 @@ func (s *Store) UpdateWikiMaintenance(ctx context.Context, jobID string, attempt
 			}
 		}
 		page.OutLinks = wiki.ParseOutLinks(page.Content)
-		if err = tx.Model(&types.WikiPage{}).Where("id = ? AND version = ?", page.ID, expected).Updates(map[string]any{"content": page.Content, "out_links": mustJSON(page.OutLinks)}).Error; err != nil {
+		linksJSON, err := json.Marshal(page.OutLinks)
+		if err != nil {
+			return err
+		}
+		if err = tx.Model(&types.WikiPage{}).Where("id = ? AND version = ?", page.ID, expected).Updates(map[string]any{"content": page.Content, "out_links": linksJSON}).Error; err != nil {
 			return err
 		}
 		return refreshBacklinks(tx, l.ID)

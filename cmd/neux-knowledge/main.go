@@ -73,7 +73,7 @@ func run(args []string, input io.Reader, output io.Writer) error {
 		return errors.New("--out is only valid for export")
 	}
 	if command == "discover" {
-		return json.NewEncoder(output).Encode(map[string]any{"protocolVersion": "1", "operations": operations, "organize": "SDK RunOrganize requires an explicit real ReaderPort/Generator; no production fixture or default model", "sqlite": "keyword search; no embedding or BM25"})
+		return json.NewEncoder(output).Encode(map[string]any{"protocolVersion": "1", "operations": operations, "organize": "SDK RunOrganize requires an explicit real ReaderPort/Generator; no production fixture or default model", "sqlite": "FTS5/BM25, sqlite-vec, normalized hybrid RRF"})
 	}
 	payload, e := io.ReadAll(io.LimitReader(input, 64<<20))
 	if e != nil {

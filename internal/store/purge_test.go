@@ -22,8 +22,12 @@ func TestPurgePreviewRejectsUnserializableSnapshot(t *testing.T) {
 	if err := s.db.Create(&job).Error; err != nil {
 		t.Fatal(err)
 	}
-	stage := types.Stage{ID: "damaged-stage", JobID: job.ID, Input: json.RawMessage(`{"private":"INVALID_SNAPSHOT_SECRET"`)}
+	stage := types.Stage{ID: "damaged-stage", JobID: job.ID, Input: json.RawMessage(`{}`)}
 	if err := s.db.Create(&stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 绕过模型序列化模拟损坏数据库；正常写入必须拒绝非法 JSON。
+	if err := s.db.Exec("UPDATE knowledge_stages SET input=? WHERE id=?", `{"private":"INVALID_SNAPSHOT_SECRET"`, stage.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	preview, err := s.PreviewSourcePurge(ctx, types.PurgePreviewInput{LibraryID: l.ID, SourceID: v.SourceID})

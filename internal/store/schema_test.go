@@ -70,7 +70,7 @@ func TestCurrentSchemaRejectsDifferentVersionWithoutRewritingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.db.Model(&schemaState{}).Where("id = ?", 1).Update("version", 2).Error; err != nil {
+	if err = s.db.Model(&schemaState{}).Where("id = ?", 1).Update("version", currentSchemaVersion+1).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err = s.Close(); err != nil {

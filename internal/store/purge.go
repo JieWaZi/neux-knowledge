@@ -224,7 +224,7 @@ func sourcePurgeSnapshot(tx *gorm.DB, in types.PurgePreviewInput) (*purgeSnapsho
 	p.BlockingJobIDs = sortedUnique(p.BlockingJobIDs)
 	serialized, err := json.Marshal(snap)
 	if err != nil {
-		return nil, nil, fail(types.ErrStorage, "source.purge.preview", "persisted purge snapshot cannot be committed")
+		return nil, nil, wrap(types.ErrStorage, "source.purge.preview", err)
 	}
 	p.Digest = hash(serialized)
 	return snap, p, nil
@@ -342,7 +342,7 @@ func scrubSourcePurge(tx *gorm.DB, snap *purgeSnapshot, preview *types.SourcePur
 		return err
 	}
 	for _, v := range record.Versions {
-		if err := tx.Where("library_id = ? AND source_version_id = ?", record.LibraryID, v.VersionID).Delete(&types.EmbeddingChunkIndex{}).Error; err != nil {
+		if err := deleteDocumentChunks(tx, record.LibraryID, v.VersionID); err != nil {
 			return err
 		}
 		if err := tx.Create(&types.SourceTombstone{VersionID: v.VersionID, SourceID: record.SourceID, LibraryID: record.LibraryID, PurgeID: record.ID}).Error; err != nil {

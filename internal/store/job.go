@@ -146,7 +146,7 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 			// Reparse clears only derived chunks, vectors, and summaries; original files and maintained Wiki content remain.
 			// Validation and cleanup occur in the acceptance transaction; mutate directly returns the original receipt when the same request is replayed.
 			for _, source := range sources {
-				if err = tx.Where("library_id = ? AND source_version_id = ?", l.ID, source.ID).Delete(&types.EmbeddingChunkIndex{}).Error; err != nil {
+				if err = deleteDocumentChunks(tx, l.ID, source.ID); err != nil {
 					return nil, err
 				}
 				changed := tx.Model(&types.SourceVersion{}).Where("id = ? AND library_id = ? AND row_version = ?", source.ID, l.ID, source.RowVersion).Updates(map[string]any{

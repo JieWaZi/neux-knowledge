@@ -2,10 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
-	"math"
-	"sort"
-	"strings"
 	"time"
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
@@ -39,20 +35,19 @@ func (s *Store) SaveDocumentChunks(ctx context.Context, jobID, sourceID string, 
 		if err = validateOrganizeSource(tx, job, sourceID); err != nil {
 			return err
 		}
-		var existing []types.EmbeddingChunkIndex
-		if err = tx.Where("library_id = ? AND state = ?", lib.ID, "indexed").Find(&existing).Error; err != nil {
-			return err
-		}
 		for _, row := range rows {
 			if row.ChunkType == "child" && row.Fingerprint != "" {
-				for _, old := range existing {
-					if old.Fingerprint != row.Fingerprint || old.EmbeddingModelID != row.EmbeddingModelID || (row.Dimensions > 0 && old.Dimensions != row.Dimensions) {
-						return fail(types.ErrVersionConflict, "index.write", "embedding endpoint or model changed; rebuild is required")
-					}
+				var mismatched int64
+				if err = tx.Model(&types.EmbeddingChunkIndex{}).Where("library_id = ? AND state = ? AND (fingerprint <> ? OR embedding_model_id <> ? OR dimensions <> ?)", lib.ID, "indexed", row.Fingerprint, row.EmbeddingModelID, row.Dimensions).Limit(1).Count(&mismatched).Error; err != nil {
+					return err
 				}
+				if mismatched > 0 {
+					return fail(types.ErrVersionConflict, "index.write", "embedding endpoint or model changed; rebuild is required")
+				}
+				break
 			}
 		}
-		if err = tx.Where("library_id = ? AND source_version_id = ?", lib.ID, sourceID).Delete(&types.EmbeddingChunkIndex{}).Error; err != nil {
+		if err = deleteDocumentChunks(tx, lib.ID, sourceID); err != nil {
 			return err
 		}
 		for i := range rows {
@@ -62,6 +57,11 @@ func (s *Store) SaveDocumentChunks(ctx context.Context, jobID, sourceID string, 
 			rows[i].UpdatedAt = rows[i].CreatedAt
 			if err = tx.Create(&rows[i]).Error; err != nil {
 				return err
+			}
+			if rows[i].State == "parsed" && rows[i].ChunkType == "child" {
+				if err = syncFTS5Insert(tx, rows[i]); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -82,12 +82,18 @@ func (s *Store) CompleteDocumentChunks(ctx context.Context, jobID, sourceID stri
 			if row.ChunkType != "child" {
 				continue
 			}
-			result := tx.Model(&types.EmbeddingChunkIndex{}).Where("id = ? AND library_id = ? AND source_version_id = ? AND fingerprint = ? AND state = ?", row.ID, lib.ID, sourceID, row.Fingerprint, "pending").Updates(map[string]any{"vector": string(mustJSON(row.Vector)), "dimensions": row.Dimensions, "state": "indexed", "diagnostic": "", "updated_at": time.Now().UnixMilli()})
+			result := tx.Model(&types.EmbeddingChunkIndex{}).Where("id = ? AND library_id = ? AND source_version_id = ? AND fingerprint = ? AND state = ?", row.ID, lib.ID, sourceID, row.Fingerprint, "pending").Updates(map[string]any{"dimensions": row.Dimensions, "state": "indexed", "diagnostic": "", "updated_at": time.Now().UnixMilli()})
 			if result.Error != nil {
 				return result.Error
 			}
 			if result.RowsAffected != 1 {
 				return fail(types.ErrVersionConflict, "index.complete", "chunk changed before embedding completed")
+			}
+			if err = writeDocumentVector(tx, row); err != nil {
+				return err
+			}
+			if err = syncFTS5Insert(tx, row); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -116,69 +122,9 @@ func (s *Store) ListDocumentChunks(ctx context.Context, libraryID, sourceID stri
 	return rows, err
 }
 
-// SearchDocumentChunks is the local SQLite adapter: compare only ready vectors in the same space with the same dimensions.
+// SearchDocumentChunks 在库范围内分别召回关键词和向量，并按 Lite 的归一化 RRF 融合。
 func (s *Store) SearchDocumentChunks(ctx context.Context, libraryID, query string, vector []float32, fingerprint string, limit int) ([]types.DocumentChunkHit, error) {
-	rows := []types.EmbeddingChunkIndex{}
-	err := s.transaction(ctx, func(tx *gorm.DB) error {
-		if _, e := getLibrary(tx, libraryID, true); e != nil {
-			return e
-		}
-		return tx.Where("library_id = ? AND chunk_type = ? AND state IN ?", libraryID, "child", []string{"parsed", "indexed"}).Find(&rows).Error
-	})
-	if err != nil {
-		return nil, err
-	}
-	hits := []types.DocumentChunkHit{}
-	for _, row := range rows {
-		score := 0.0
-		if len(vector) > 0 {
-			if row.State != "indexed" {
-				continue
-			}
-			if row.Fingerprint != fingerprint || row.Dimensions != len(vector) {
-				return nil, fail(types.ErrVersionConflict, "index.search", "embedding endpoint, model or dimensions changed; rebuild is required")
-			}
-			score = cosineSimilarity(vector, row.Vector)
-		} else {
-			if query == "" || !strings.Contains(strings.ToLower(row.Content), strings.ToLower(query)) {
-				continue
-			}
-			score = 1
-		}
-		hits = append(hits, types.DocumentChunkHit{Chunk: row, Score: score})
-	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score == hits[j].Score {
-			return hits[i].Chunk.ID < hits[j].Chunk.ID
-		}
-		return hits[i].Score > hits[j].Score
-	})
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	if len(hits) > limit {
-		hits = hits[:limit]
-	}
-	return hits, nil
-}
-func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
-
-// cosineSimilarity computes cosine similarity between vectors.
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) == 0 || len(a) != len(b) {
-		return 0
-	}
-	var dot, normA, normB float64
-	for i := range a {
-		x, y := float64(a[i]), float64(b[i])
-		dot += x * y
-		normA += x * x
-		normB += y * y
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	return s.searchDocumentIndex(ctx, libraryID, query, vector, fingerprint, limit)
 }
 
 // GetDocumentChunkParents reads parent chunks only within the specified library for at most five actual hit identities.
