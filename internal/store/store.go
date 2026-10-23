@@ -136,7 +136,7 @@ func (s *Store) Close() error {
 }
 
 // currentSchemaVersion is the sole version of the current development schema; the core does not run historical upgrades.
-const currentSchemaVersion = 2
+const currentSchemaVersion = 1
 
 // schemaState identifies the current schema used by this database without recording a historical migration sequence.
 type schemaState struct {
