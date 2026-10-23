@@ -85,6 +85,88 @@ func validateFrozenSources(tx *gorm.DB, j *types.Job) error {
 	return nil
 }
 
+// ensureSourcesUnoccupied 在接纳事务中按原件身份去重，覆盖排队、执行中及不同版本。
+func ensureSourcesUnoccupied(tx *gorm.DB, j *types.Job) error {
+	var count int64
+	err := tx.Model(&types.Job{}).
+		Where("library_id = ? AND id <> ? AND state IN ?", j.LibraryID, j.ID, []string{"queued", "processing", "cancel_requested"}).
+		Where("EXISTS (SELECT 1 FROM json_each(source_version_ids) WHERE value IN (SELECT id FROM knowledge_source_versions WHERE library_id = ? AND source_id IN (SELECT source_id FROM knowledge_source_versions WHERE id IN ?)))", j.LibraryID, j.SourceVersionIDs).
+		Count(&count).Error
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return fail(types.ErrVersionConflict, "job.sources", "source is already queued or processing")
+	}
+	return nil
+}
+
+// queueAdmissionTime 保证同毫秒接纳与重试仍按事务提交的顺序排队。
+func queueAdmissionTime(tx *gorm.DB, libraryID string) (int64, error) {
+	var rows []types.Job
+	if err := tx.Select("attempt_started_at").Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Order("attempt_started_at DESC").Limit(1).Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	now := time.Now().UnixMilli()
+	if len(rows) > 0 && rows[0].AttemptStartedAt >= now {
+		now = rows[0].AttemptStartedAt + 1
+	}
+	return now, nil
+}
+
+// queueHead 优先恢复正在执行的任务，其余按本次接纳顺序串行处理。
+func queueHead(tx *gorm.DB, libraryID string) (*types.Job, error) {
+	var rows []*types.Job
+	err := tx.Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Order("CASE WHEN state = 'queued' THEN 1 ELSE 0 END, attempt_started_at ASC, created_at ASC, id ASC").Limit(1).Find(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// ActivateQueuedJob 只允许队首在库级处理锁内启动；未开始的任务沿用最新目录屏障。
+func (s *Store) ActivateQueuedJob(ctx context.Context, jobID string) (result *types.Job, ready bool, err error) {
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		ready = false
+		var e error
+		result, e = getJob(tx, jobID)
+		if e != nil {
+			return e
+		}
+		head, e := queueHead(tx, result.LibraryID)
+		if e != nil {
+			return e
+		}
+		if head == nil || head.ID != jobID {
+			return nil
+		}
+		if result.CancelRequested {
+			ready = true
+			return nil
+		}
+		j, lib, e := activeJob(tx, jobID)
+		if e != nil {
+			return e
+		}
+		if e = validateFrozenSources(tx, j); e != nil {
+			return e
+		}
+		if j.State == "queued" {
+			changed := tx.Model(&types.Job{}).Where("id = ? AND version = ? AND state = ?", j.ID, j.Version, "queued").Updates(map[string]any{"state": "processing", "structure_version": lib.StructureVersion, "version": j.Version + 1, "updated_at": time.Now().UnixMilli()})
+			if changed.Error != nil {
+				return changed.Error
+			}
+			if changed.RowsAffected != 1 {
+				return fail(types.ErrVersionConflict, "job.activate", "job changed before activation")
+			}
+			j.State, j.StructureVersion, j.Version = "processing", lib.StructureVersion, j.Version+1
+		}
+		result, ready = j, true
+		return nil
+	})
+	return
+}
+
 // AcceptJob persists only the frozen scope and sources; it does not execute models.
 func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.Receipt, error) {
 	return s.mutate(ctx, in.RequestID, "job.accept", in.LibraryID, in, func(tx *gorm.DB) (*types.Receipt, error) {
@@ -125,6 +207,9 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 		if err = tx.Where("id IN ?", j.SourceVersionIDs).Find(&sources).Error; err != nil {
 			return nil, err
 		}
+		if err = ensureSourcesUnoccupied(tx, &j); err != nil {
+			return nil, err
+		}
 		pending := make([]string, 0, len(sources))
 		for _, v := range sources {
 			if in.Rebuild || (v.State != "processed" && v.State != "no-change") {
@@ -135,12 +220,9 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 			return &types.Receipt{State: "no-op"}, nil
 		}
 		j.SourceVersionIDs = pending
-		var active int64
-		if err = tx.Model(&types.Job{}).Where("library_id = ? AND state IN ?", l.ID, []string{"queued", "processing", "cancel_requested"}).Count(&active).Error; err != nil {
+		j.AttemptStartedAt, err = queueAdmissionTime(tx, l.ID)
+		if err != nil {
 			return nil, err
-		}
-		if active > 0 {
-			return nil, fail(types.ErrVersionConflict, "job.accept", "another library writer is active")
 		}
 		if in.Rebuild {
 			// Reparse clears only derived chunks, vectors, and summaries; original files and maintained Wiki content remain.
@@ -270,7 +352,14 @@ func (s *Store) RetryJob(ctx context.Context, in types.JobActionInput) (*types.R
 		if err = validateFrozenSources(tx, j); err != nil {
 			return nil, err
 		}
-		r := tx.Model(&types.Job{}).Where("id = ? AND version = ?", j.ID, j.Version).Updates(map[string]any{"attempt": j.Attempt + 1, "state": "queued", "diagnostic": "", "attempt_started_at": time.Now().UnixMilli(), "cancel_requested": false, "version": j.Version + 1, "structure_version": l.StructureVersion, "updated_at": time.Now().UnixMilli()})
+		if err = ensureSourcesUnoccupied(tx, j); err != nil {
+			return nil, err
+		}
+		admittedAt, err := queueAdmissionTime(tx, l.ID)
+		if err != nil {
+			return nil, err
+		}
+		r := tx.Model(&types.Job{}).Where("id = ? AND version = ?", j.ID, j.Version).Updates(map[string]any{"attempt": j.Attempt + 1, "state": "queued", "diagnostic": "", "attempt_started_at": admittedAt, "cancel_requested": false, "version": j.Version + 1, "structure_version": l.StructureVersion, "updated_at": time.Now().UnixMilli()})
 		if r.Error != nil {
 			return nil, r.Error
 		}
@@ -421,18 +510,9 @@ func (s *Store) FailJob(ctx context.Context, in types.FailJobInput) (*types.Rece
 	})
 }
 
-// GetActiveJob reads only the sole task occupying this library's slot; historical ordering does not determine current state.
+// GetActiveJob 返回正在执行或下一位等待执行的队首任务。
 func (s *Store) GetActiveJob(ctx context.Context, libraryID string) (result *types.Job, err error) {
-	err = s.transaction(ctx, func(tx *gorm.DB) error {
-		var rows []*types.Job
-		if e := tx.Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Limit(1).Find(&rows).Error; e != nil {
-			return e
-		}
-		if len(rows) > 0 {
-			result = rows[0]
-		}
-		return nil
-	})
+	err = s.transaction(ctx, func(tx *gorm.DB) error { var e error; result, e = queueHead(tx, libraryID); return e })
 	return
 }
 

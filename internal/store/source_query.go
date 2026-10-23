@@ -15,50 +15,101 @@ type sourceActivity struct {
 	Diagnostic string // Current dead-letter diagnostic; other in-flight states clear stale diagnostics.
 }
 
-// sourceActivities derives overlays only from the task occupying the slot and work in its current attempt; done retains the source's terminal state.
-func sourceActivities(tx *gorm.DB, libraryID string) (map[string]sourceActivity, error) {
+// sourceActivitySnapshot 同时提供展示状态与原件占用，终态展示不能解除未结束任务的占用。
+type sourceActivitySnapshot struct {
+	Versions map[string]sourceActivity // 当前尝试对来源版本的展示状态。
+	Occupied map[string]bool           // 所有在途任务仍然拥有的原件身份。
+}
+
+// sourceActivities 汇总全部在途任务及其当前尝试，来源终态仍由原记录保存。
+func sourceActivities(tx *gorm.DB, libraryID string) (sourceActivitySnapshot, error) {
+	result := sourceActivitySnapshot{Versions: map[string]sourceActivity{}, Occupied: map[string]bool{}}
 	var jobs []types.Job
-	if err := tx.Select("id,attempt,source_version_ids").Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Limit(1).Find(&jobs).Error; err != nil {
-		return nil, err
+	if err := tx.Select("id,attempt,source_version_ids").Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Find(&jobs).Error; err != nil {
+		return result, err
 	}
-	result := map[string]sourceActivity{}
 	if len(jobs) == 0 {
 		return result, nil
 	}
-	j := jobs[0]
+	versions := make([]string, 0)
+	seen := map[string]bool{}
+	for _, j := range jobs {
+		for _, id := range j.SourceVersionIDs {
+			if !seen[id] {
+				seen[id] = true
+				versions = append(versions, id)
+			}
+		}
+	}
+	for start := 0; start < len(versions); start += 500 {
+		end := start + 500
+		if end > len(versions) {
+			end = len(versions)
+		}
+		var sources []types.SourceVersion
+		if err := tx.Select("source_id").Where("library_id = ? AND id IN ?", libraryID, versions[start:end]).Find(&sources).Error; err != nil {
+			return result, err
+		}
+		for _, source := range sources {
+			result.Occupied[source.SourceID] = true
+		}
+	}
 	var work []types.OrganizeSourceWork
-	if err := tx.Select("source_version_id,state,diagnostic,started_at").Where("job_id = ? AND job_attempt = ?", j.ID, j.Attempt).Find(&work).Error; err != nil {
-		return nil, err
+	for start := 0; start < len(jobs); start += 100 {
+		end := start + 100
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		clauses := make([]string, 0, end-start)
+		args := make([]any, 0, (end-start)*2)
+		for _, j := range jobs[start:end] {
+			clauses = append(clauses, "(job_id = ? AND job_attempt = ?)")
+			args = append(args, j.ID, j.Attempt)
+		}
+		var batch []types.OrganizeSourceWork
+		if err := tx.Select("job_id,job_attempt,source_version_id,state,diagnostic,started_at").Where(strings.Join(clauses, " OR "), args...).Find(&batch).Error; err != nil {
+			return result, err
+		}
+		work = append(work, batch...)
 	}
-	current := make(map[string]types.OrganizeSourceWork, len(work))
+	current := make(map[string]map[string]types.OrganizeSourceWork, len(jobs))
+	attempts := map[string]int{}
+	for _, j := range jobs {
+		attempts[j.ID] = j.Attempt
+		current[j.ID] = map[string]types.OrganizeSourceWork{}
+	}
 	for _, w := range work {
-		current[w.SourceVersionID] = w
+		if attempts[w.JobID] == w.JobAttempt {
+			current[w.JobID][w.SourceVersionID] = w
+		}
 	}
-	for _, id := range j.SourceVersionIDs {
-		w, ok := current[id]
-		if ok && w.State == "done" {
-			continue
+	for _, j := range jobs {
+		for _, id := range j.SourceVersionIDs {
+			w, ok := current[j.ID][id]
+			if ok && w.State == "done" {
+				continue
+			}
+			activity := sourceActivity{State: "queued"}
+			if ok && w.State == "dead" {
+				activity.State, activity.Diagnostic = "failed", w.Diagnostic
+			} else if ok && w.StartedAt > 0 {
+				activity.State = "processing"
+			}
+			result.Versions[id] = activity
 		}
-		activity := sourceActivity{State: "queued"}
-		if ok && w.State == "dead" {
-			activity.State = "failed"
-			activity.Diagnostic = w.Diagnostic
-		} else if ok && w.StartedAt > 0 {
-			activity.State = "processing"
-		}
-		result[id] = activity
 	}
 	return result, nil
 }
 
-func projectSourceActivity(sources []*types.SourceVersion, activity map[string]sourceActivity) []*types.SourceVersion {
+func projectSourceActivity(sources []*types.SourceVersion, activity sourceActivitySnapshot) []*types.SourceVersion {
 	result := make([]*types.SourceVersion, 0, len(sources))
 	for _, s := range sources {
 		if s == nil {
 			continue
 		}
 		v := *s
-		if a, ok := activity[s.ID]; ok && !s.Archived && s.State != "processed" && s.State != "no-change" {
+		v.OrganizeBlocked = activity.Occupied[s.SourceID]
+		if a, ok := activity.Versions[s.ID]; ok && !s.Archived && s.State != "processed" && s.State != "no-change" {
 			v.State = a.State
 			v.Diagnostic = a.Diagnostic
 		}
@@ -125,7 +176,7 @@ func (s *Store) ListSourcesQuery(ctx context.Context, libraryID string, in types
 		}
 		if state != "all" {
 			ids := map[string][]string{}
-			for id, a := range activity {
+			for id, a := range activity.Versions {
 				ids[a.State] = append(ids[a.State], id)
 			}
 			// Bind one JSON parameter per identity group to avoid exceeding SQLite's variable limit when many sources are active.

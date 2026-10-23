@@ -16,6 +16,7 @@ type (
 	KnowledgeProfile     = types.KnowledgeProfile
 	PermissionSnapshot   = types.PermissionSnapshot
 	Page                 = types.WikiPage
+	PageDirectoryEntry   = types.WikiPageDirectoryEntry
 	Theme                = types.WikiFolder
 	Revision             = types.WikiPageRevision
 	Job                  = types.Job
@@ -64,3 +65,6 @@ const (
 
 // FailJobInput records an actual failure without page writes.
 type FailJobInput = types.FailJobInput
+
+// PageDirectoryMaxLimit 是轻量目录单批上限。
+const PageDirectoryMaxLimit = types.PageDirectoryMaxLimit

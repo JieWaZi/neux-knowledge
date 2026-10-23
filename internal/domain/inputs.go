@@ -50,14 +50,14 @@ type ArchiveSourceInput struct {
 	Archived        bool   // Target archive state.
 }
 
-// WritePageInput explicitly carries base versions for content and directory structure.
+// WritePageInput 携带内容版本、目录版本和整页生成时的读取时间。
 type WritePageInput struct {
-	ExpectedPolicyVersion int64    // Explicitly frozen permission generation; zero disables freezing, and positive values must match within the content write transaction.
-	RequestID             string   // Idempotent request identifier.
-	LibraryID             string   // Target library.
-	ExpectedVersion       int      // Current page version; 0 on creation.
-	StructureVersion      int64    // Current structure version.
-	Page                  WikiPage // Page content; TenantID is ignored and the library identifier must match.
+	ExpectedPolicyVersion int64    // 冻结的权限代次；零表示不冻结，正值须在内容事务内匹配。
+	RequestID             string   // 稳定幂等请求身份。
+	LibraryID             string   // 目标知识库。
+	ExpectedVersion       int      // 已读取的内容版本，新建为零。
+	StructureVersion      int64    // 已读取的目录版本。
+	Page                  WikiPage // 页面内容；更新必须原样携带读取时的 UpdatedAt，忽略租户字段且库身份须匹配。
 }
 
 // RestorePageInput restores historical content while preserving the current theme and order.

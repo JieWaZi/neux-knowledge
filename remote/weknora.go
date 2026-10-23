@@ -259,33 +259,37 @@ func (c *WeKnora) GetLibrary(ctx context.Context, id string) (*Library, error) {
 
 // Page contains displayable fields from the fixed official Wiki DTO.
 type Page struct {
-	// ID is the stable page identity.
+	// ID 是稳定页面身份。
 	ID string `json:"id"`
-	// KnowledgeBaseID is the authoritative library identity.
+	// KnowledgeBaseID 是权威知识库身份。
 	KnowledgeBaseID string `json:"knowledge_base_id"`
-	// Slug preserves the original hierarchical value.
+	// Slug 保留远端页面层级地址。
 	Slug string `json:"slug"`
-	// Title is the title.
+	// Title 是页面标题。
 	Title string `json:"title"`
-	// Summary is the current page description, compared using the same field in historical snapshots.
+	// Summary 是当前页面简介，历史比较使用相同字段。
 	Summary string `json:"summary"`
 
-	// PageType is the official page type.
+	// PageType 是官方页面类型。
 	PageType string `json:"page_type"`
-	// Content is the Markdown returned when reading.
+	// Content 是官方读取返回的 Markdown 正文。
 	Content string `json:"content"`
-	// Version is the remote content version.
+	// Version 是远端内容版本。
 	Version int `json:"version"`
-	// FolderID is the remote topic identity.
+	// FolderID 是远端目录身份。
 	FolderID string `json:"folder_id"`
-	// Aliases contains query aliases.
+	// Aliases 是页面查询别名。
 	Aliases []string `json:"aliases"`
-	// SourceRefs contains official source references.
+	// SourceRefs 是官方来源引用。
 	SourceRefs []string `json:"source_refs"`
-	// InLinks contains inbound link handles.
+	// InLinks 是入链地址。
 	InLinks []string `json:"in_links"`
-	// OutLinks contains outbound link handles.
+	// OutLinks 是出链地址。
 	OutLinks []string `json:"out_links"`
+	// CategoryPath 保留官方目录路径。
+	CategoryPath []string `json:"category_path"`
+	// SortOrder 保留官方目录排序。
+	SortOrder int `json:"sort_order"`
 }
 
 // PageOptions uses official one-based page numbers; an offset must not be passed directly as page.

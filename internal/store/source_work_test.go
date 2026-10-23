@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"gorm.io/gorm"
 	"path/filepath"
 	"testing"
+	"time"
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 )
@@ -145,5 +147,75 @@ func TestSourceWorkRejectsLatePreviousJobAttempt(t *testing.T) {
 	items, err := s.ListOrganizeSourceWork(ctx, job.ID)
 	if err != nil || len(items) != 1 || items[0].JobAttempt != 2 || items[0].FailureCount != 0 || items[0].Version != 1 {
 		t.Fatalf("late attempt changed queue=%+v %v", items, err)
+	}
+}
+
+// TestLiteContributionReceiptRollsBackWithPage 防止页面与贡献回执分开提交后丢失恢复边界。
+func TestLiteContributionReceiptRollsBackWithPage(t *testing.T) {
+	ctx := context.Background()
+	s, library, source, job := sourceWorkFixture(t)
+	const key = "applied/source-page"
+	if err := s.db.Exec(`CREATE TRIGGER reject_contribution BEFORE INSERT ON knowledge_receipts WHEN NEW.request_id='applied/source-page' BEGIN SELECT RAISE(ABORT,'controlled receipt failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	publication := &types.Publication{Pages: []types.PageMutation{{Page: types.WikiPage{KnowledgeBaseID: library.ID, Slug: "concept/atomic", Title: "原子贡献", PageType: "concept", Status: "published", Content: "真实来源支撑的页面。", Evidence: types.PageEvidence{Sources: []types.SourceRef{{SourceID: source.SourceID, SourceVersionID: source.ID, SHA256: source.SHA256, ClaimKind: "document_context"}}}}}}}
+	if _, err := s.PublishLite(ctx, "atomic-publication", job.ID, job.Attempt, publication, key); err == nil {
+		t.Fatal("controlled transaction failure did not fail")
+	}
+	if _, err := s.GetPageBySlug(ctx, library.ID, "concept/atomic"); err == nil {
+		t.Fatal("page survived failed contribution transaction")
+	}
+	if _, err := s.GetReceipt(ctx, key); err == nil {
+		t.Fatal("receipt survived failed contribution transaction")
+	}
+	if err := s.db.Exec("DROP TRIGGER reject_contribution").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PublishLite(ctx, "atomic-publication", job.ID, job.Attempt, publication, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetReceipt(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.GetPageBySlug(ctx, library.ID, "concept/atomic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PublishLite(ctx, "atomic-publication", job.ID, job.Attempt, publication, key); err != nil {
+		t.Fatal(err)
+	}
+	replay, _ := s.GetPageBySlug(ctx, library.ID, "concept/atomic")
+	if replay.Version != page.Version {
+		t.Fatal("receipt replay changed page version")
+	}
+}
+
+// TestTransactionAdmissionCanBeCancelled 排队中的事务取消不应等待写入者结束或产生数据修改。
+func TestTransactionAdmissionCanBeCancelled(t *testing.T) {
+	s, _, _, _ := sourceWorkFixture(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- s.transaction(context.Background(), func(_ *gorm.DB) error { close(entered); <-release; return nil })
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- s.transaction(ctx, func(_ *gorm.DB) error { t.Error("cancelled transaction entered callback"); return nil })
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("cancel result=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("cancelled admission waited for writer")
+	}
+	close(release)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
 	}
 }

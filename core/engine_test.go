@@ -288,7 +288,7 @@ func TestFailureSettlementIsDurableAndCannotRewritePublishedSources(t *testing.T
 	code(t, err, core.ErrScopeViolation)
 }
 
-func TestJobFreezesPreferencesAndRejectsConcurrentLibraryWriter(t *testing.T) {
+func TestJobFreezesPreferencesAndQueuesDistinctSources(t *testing.T) {
 	ctx := context.Background()
 	e, _ := open(t)
 	l := library(t, e, "frozen")
@@ -298,8 +298,8 @@ func TestJobFreezesPreferencesAndRejectsConcurrentLibraryWriter(t *testing.T) {
 	if j.LibrarySnapshot == nil || j.LibrarySnapshot.WikiConfig != nil {
 		t.Fatal("accepted library configuration was not frozen")
 	}
-	if _, err := e.AcceptJob(ctx, core.AcceptJobInput{RequestID: "concurrent-writer", LibraryID: l.ID, ExpectedVersion: l.Version, StructureVersion: l.StructureVersion, SourceVersionIDs: []string{b.ID}, Permission: core.PermissionSnapshot{PolicyVersion: l.PolicyVersion, Operations: []string{"organize"}}, RulesVersion: "test", ConfigDigest: "test"}); err == nil {
-		t.Fatal("two library writers were accepted")
+	if _, err := e.AcceptJob(ctx, core.AcceptJobInput{RequestID: "concurrent-writer", LibraryID: l.ID, ExpectedVersion: l.Version, StructureVersion: l.StructureVersion, SourceVersionIDs: []string{b.ID}, Permission: core.PermissionSnapshot{PolicyVersion: l.PolicyVersion, Operations: []string{"organize"}}, RulesVersion: "test", ConfigDigest: "test"}); err != nil {
+		t.Fatal("distinct sources could not queue", err)
 	}
 }
 

@@ -66,3 +66,13 @@ func (e *Engine) RenamePage(ctx context.Context, in RenamePageInput) (*Receipt, 
 func (e *Engine) DeletePage(ctx context.Context, in DeletePageInput) (*Receipt, error) {
 	return e.store.DeletePage(ctx, in)
 }
+
+// ListPageDirectory 只查询目录展示字段，不读取正文、证据和引用关系。
+func (e *Engine) ListPageDirectory(ctx context.Context, libraryID string, offset, limit int) ([]*PageDirectoryEntry, int64, error) {
+	return e.store.ListPageDirectory(ctx, libraryID, offset, limit)
+}
+
+// CountPagesByTheme 一次聚合各目录的页面数，不读取页面内容。
+func (e *Engine) CountPagesByTheme(ctx context.Context, libraryID string) (map[string]int64, error) {
+	return e.store.CountPagesByTheme(ctx, libraryID)
+}

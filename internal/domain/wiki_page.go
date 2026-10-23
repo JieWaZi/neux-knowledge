@@ -189,117 +189,95 @@ func IsValidWikiPageStatus(status string) bool {
 // Wiki pages are LLM-generated, interlinked markdown documents that form
 // a persistent, compounding knowledge artifact.
 type WikiPage struct {
-	// WikiLanguage is the content language, independent of the interface language.
+	// WikiLanguage 正文语言，与界面语言独立。
 	WikiLanguage string `json:"wikiLanguage"`
-	// Evidence is the only writable structured evidence; the core derives SourceRefs.
+	// Evidence 唯一可写的结构化证据，来源引用由核心推导。
 	Evidence PageEvidence `json:"evidence" gorm:"serializer:json"`
-	// ManualPlacement prevents generation from overwriting manual placement and order.
+	// ManualPlacement 是否保护人工确定的目录和顺序。
 	ManualPlacement bool `json:"manualPlacement"`
-	// ProtectedContent contains manually edited content fragments that must be preserved verbatim.
+	// ProtectedContent 必须逐字保留的人工正文片段。
 	ProtectedContent StringArray `json:"protectedContent" gorm:"type:json"`
-	// Unique identifier (UUID)
-	// ID is the stable record identifier.
+	// ID 页面稳定身份。
 	ID string `json:"id" gorm:"type:varchar(36);primaryKey"`
-	// Workspace ID for multi-workspace isolation
-	// TenantID is retained for the upstream algorithm and is fixed at zero in the standalone core.
+	// TenantID 兼容上游算法的租户字段，独立核心固定为零。
 	TenantID uint64 `json:"tenant_id" gorm:"index"`
-	// Knowledge base this page belongs to
-	// KnowledgeBaseID is the stable identifier of the owning knowledge library.
+	// KnowledgeBaseID 所属知识库的稳定身份。
 	KnowledgeBaseID string `json:"knowledge_base_id" gorm:"type:varchar(36);index;uniqueIndex:idx_kb_slug"`
-	// URL-friendly slug for addressing, e.g. "entity/acme-corp", "concept/rag"
-	// Unique within a knowledge base
-	// Slug is the page's stable readable identifier.
+	// Slug 库内唯一的可读页面地址。
 	Slug string `json:"slug" gorm:"type:varchar(255);uniqueIndex:idx_kb_slug" extensions:"x-agent"`
-	// Human-readable title
-	// Title is the visible page title.
+	// Title 用户可见的页面标题。
 	Title string `json:"title" gorm:"type:varchar(512)" extensions:"x-agent"`
-	// Page type: summary, entity, concept, index, synthesis, comparison
-	// PageType is the page's knowledge type.
+	// PageType 知识页面类型。
 	PageType string `json:"page_type" gorm:"type:varchar(32);index" extensions:"x-agent"`
-	// Page status: draft, published, archived
-	// Status is the current state of the page or issue.
+	// Status 草稿、已发布或已归档状态。
 	Status string `json:"status" gorm:"type:varchar(32);default:'published'" extensions:"x-agent"`
-	// Full markdown content
-	// Content is the page body in Markdown.
+	// Content Markdown 正文。
 	Content string `json:"content" gorm:"type:text"`
-	// One-line summary for index listing
-	// Summary stores the page introduction for directory entries without the full content.
+	// Summary 目录中显示的页面简介。
 	Summary string `json:"summary" gorm:"type:text" extensions:"x-agent"`
-	// Alternate names, abbreviations, acronyms or translated names
-	// Aliases supports exact identity matching and keyword queries.
+	// Aliases 精确身份匹配和搜索使用的别名。
 	Aliases StringArray `json:"aliases" gorm:"type:json"`
-	// ParentSlug optionally points at the wiki page that should act as this
-	// page's semantic parent in the directory tree. The parent may be empty
-	// when the page is grouped only by FolderID.
-	// ParentSlug is the upstream parent page identifier.
+	// ParentSlug 可选的语义父页面地址。
 	ParentSlug string `json:"parent_slug,omitempty" gorm:"type:varchar(255);index"`
-	// FolderID is the single source of truth for where this page sits in the
-	// directory tree — a reference to wiki_folders.id ("" = wiki root). The
-	// CategoryPath / WikiPath / Depth fields below are denormalized caches
-	// recomputed from this folder's chain on every write so list/index/search
-	// queries don't have to join wiki_folders.
-	// FolderID is the stable identifier of the actual owning theme.
+	// FolderID 页面所属目录的唯一权威身份，空值表示根目录。
 	FolderID string `json:"folder_id,omitempty" gorm:"column:folder_id;type:varchar(36);index;default:''" extensions:"x-agent"`
-	// CategoryPath is the directory breadcrumb that groups this page in the
-	// wiki browser, e.g. ["AI", "LLM Applications", "RAG"]. Derived cache of the
-	// folder chain identified by FolderID.
+	// CategoryPath 从所属目录链推导的面包屑缓存。
 	CategoryPath StringArray `json:"category_path,omitempty" gorm:"type:json"`
-	// WikiPath is a normalized, sortable path derived from page_type,
-	// category_path, and title. It keeps large directory listings cheap to sort.
-	// WikiPath is a derived path for directory display and sorting.
+	// WikiPath 根据目录与标题推导的显示及排序路径。
 	WikiPath string `json:"wiki_path,omitempty" gorm:"type:varchar(1024);index"`
-	// Depth is len(CategoryPath), cached for filtering / display.
-	// Depth is the number of levels in the current theme or category path.
+	// Depth 目录链层数的缓存。
 	Depth int `json:"depth,omitempty" gorm:"default:0;index"`
-	// SortOrder allows generated or manually edited pages to control sibling
-	// ordering before falling back to title.
-	// SortOrder controls sibling display order; smaller values come first.
+	// SortOrder 同级显示顺序，值小的在前。
 	SortOrder int `json:"sort_order,omitempty" gorm:"default:0;index"`
-	// References to source knowledge IDs that contributed to this page.
-	// Format matches the legacy "<knowledge_id>|<doc_title>" convention used
-	// across the ingest pipeline, so retract / display code can split on `|`
-	// to recover the title. Document-level granularity.
-	// SourceRefs contains upstream source references; public writes derive them from structured evidence.
+	// SourceRefs 由结构化证据推导的来源引用，不能独立写入。
 	SourceRefs StringArray `json:"source_refs" gorm:"type:json"`
-	// ChunkRefs records the specific source-document chunks this page was
-	// built from — one UUID per cited chunk. Populated during ingest from
-	// the chunk-citation pass; refreshed wholesale whenever the page is
-	// re-materialized. Empty for summary pages (they are document-level
-	// synopses and don't carry chunk-level citations). Use this when you
-	// need to surface the underlying evidence for a wiki page, or to
-	// retract citations when a source document is deleted.
-	// ChunkRefs contains verifiable reader chunk references.
+	// ChunkRefs 贡献正文的可验证原文分块引用。
 	ChunkRefs StringArray `json:"chunk_refs" gorm:"type:json"`
-	// Slugs of pages that link TO this page (backlinks)
-	// InLinks contains stable slugs linking to this page.
+	// InLinks 引用当前页面的入链地址缓存。
 	InLinks StringArray `json:"in_links" gorm:"type:json"`
-	// Slugs of pages this page links to (outbound links)
-	// OutLinks contains stable slugs referenced by this page.
+	// OutLinks 从当前正文解析的出链地址缓存。
 	OutLinks StringArray `json:"out_links" gorm:"type:json"`
-	// Arbitrary metadata (tags, categories, dates, etc.)
-	// PageMetadata contains additional structured page information.
+	// PageMetadata 页面附加结构化信息。
 	PageMetadata JSON `json:"page_metadata" gorm:"column:page_metadata;type:json"`
-	// Version protects all persistent page writes; content, evidence, link, and directory changes all require CAS.
+	// Version 用户可见内容版本；同次整理最多增加一版，内部中间写入另以 UpdatedAt 校验。
 	Version int `json:"version" gorm:"default:1" extensions:"x-agent"`
-	// LastEditSource records who authored the CURRENT version: pipeline |
-	// agent | user | revert. Empty uses the pipeline default.
-	// When the version is superseded this value travels into the revision
-	// snapshot, so each historical version keeps its own author kind.
-	// LastEditSource is the actual write source category of the current version.
+	// LastEditSource 当前内容版本的实际作者类型，历史快照沿用该归属。
 	LastEditSource string `json:"last_edit_source,omitempty" gorm:"type:varchar(16);default:''"`
-	// LastEditorID is the user id of the caller that produced the current
-	// version (empty for background pipeline writes).
-	// LastEditorID is the actual editor identifier of the current version.
+	// LastEditorID 当前内容版本的实际编辑者身份。
 	LastEditorID string `json:"last_editor_id,omitempty" gorm:"type:varchar(64);default:''"`
-	// Creation time
-	// CreatedAt is the record creation time.
+	// CreatedAt 记录创建时间。
 	CreatedAt time.Time `json:"created_at"`
-	// Last update time
-	// UpdatedAt is the most recent record update time.
+	// UpdatedAt 最近一次写入时间，也是同一内容版本内的读取屏障。
 	UpdatedAt time.Time `json:"updated_at" extensions:"x-agent"`
-	// Soft delete
-	// DeletedAt is the upstream soft-deletion time and does not indicate completion of physical original-file cleanup.
+	// DeletedAt 软删除时间，不表示原件物理清理完成。
 	DeletedAt gorm.DeletedAt `json:"deleted_at" gorm:"index"`
+}
+
+// PageDirectoryMaxLimit 限制轻量目录单批的最大条数。
+const PageDirectoryMaxLimit = 1000
+
+// WikiPageDirectoryEntry 只承载导航、搜索与索引展示需要的页面字段。
+type WikiPageDirectoryEntry struct {
+	// ID 页面稳定身份。
+	ID string `json:"id"`
+	// KnowledgeBaseID 所属知识库，用于远端范围校验。
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	// Slug 库内可读地址。
+	Slug string `json:"slug"`
+	// Title 页面标题。
+	Title string `json:"title"`
+	// PageType 页面类型。
+	PageType string `json:"page_type"`
+	// Summary 目录与索引展示的简介。
+	Summary string `json:"summary"`
+	// FolderID 页面所属目录。
+	FolderID string `json:"folder_id"`
+	// CategoryPath 索引展示的目录路径。
+	CategoryPath StringArray `json:"category_path" gorm:"type:json"`
+	// SortOrder 同目录展示顺序。
+	SortOrder int `json:"sort_order"`
+	// Version 当前内容版本。
+	Version int `json:"version"`
 }
 
 // WikiPageDetail adds display titles to the page detail response without
@@ -406,18 +384,12 @@ func (WikiPageRevision) TableName() string {
 	return "wiki_page_revisions"
 }
 
-// Snapshot retention is two-tiered, because the two kinds of history have
-// very different value. A hot hub page is rewritten by the ingest pipeline on
-// every related batch, so machine snapshots would otherwise crowd out the
-// handful of human/agent edits this feature exists to protect.
+// Wiki 修订统一保留最近 50 个版本（含当前页），不按编辑来源延长保留。
 const (
-	// WikiMaxRevisionsPerPage is how many recent versions are kept for
-	// prunable (machine-authored) snapshots.
+	// WikiMaxRevisionsPerPage 是每页当前版本与历史快照合计的统一上限。
 	WikiMaxRevisionsPerPage = 50
-	// WikiMaxRevisionsHardCap is the absolute per-page ceiling, applied
-	// regardless of author, so a page edited only by hand still has bounded
-	// storage.
-	WikiMaxRevisionsHardCap = 200
+	// WikiMaxRevisionsHardCap 与统一上限一致，供底层裁剪请求使用。
+	WikiMaxRevisionsHardCap = WikiMaxRevisionsPerPage
 )
 
 // WikiPrunableEditSources lists the edit sources whose snapshots may be

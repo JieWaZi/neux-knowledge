@@ -188,8 +188,8 @@ func TestLiteReduceFailureKeepsSourceSummaryAndStripsDeadLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.State != "completed" {
-		t.Fatalf("upstream addition failure should not requeue source: %s", result.State)
+	if result.State != "failed" {
+		t.Fatalf("permanent generation failure must not report source completed: %s", result.State)
 	}
 	pages, _, _ := s.ListPages(context.Background(), types.PageQuery{LibraryID: j.LibraryID, Limit: 20})
 	for _, page := range pages {
@@ -438,7 +438,7 @@ func TestLiteSourceFailureBudgetSurvivesRecovery(t *testing.T) {
 	}
 	model := &contractModel{respond: func(r GenerateRequest) (GenerateResult, error) {
 		if r.Stage == "summary" {
-			return GenerateResult{}, fmt.Errorf("status 403: denied")
+			return GenerateResult{}, fmt.Errorf("status 503: upstream unavailable")
 		}
 		return normalReply(r)
 	}}

@@ -18,16 +18,16 @@ const WikiTaxonomyPlanPrompt = `You are organizing a wiki knowledge base into a 
 </items>
 
 <instructions>
-For every item, output a category path: an array of folder labels from broad to narrow (at most 2 levels). The category classifies WHAT the item fundamentally IS (the stable library "shelf" it always sits on), never the role it plays in one document.
+For every item, output a category path: an array of folder labels from broad to narrow (at most 2 levels). Organize by the item's primary subject and the durable topic a reader would browse to find it. Use its title and description, not just shared words or its role in one document.
 
 How to choose a path for each item:
-1. If an existing folder in <existing_folders> fits, REUSE its EXACT label (character-for-character). Do NOT invent a synonym folder (e.g. do NOT create "春节习俗" when "春节 / 传统习俗" already fits).
-2. If NO existing folder fits, CREATE a new, broad, durable folder for it (e.g. an organization → "组织", a legal idea → "法律概念", a place → "地点"). The directory does not have to stay small — most items DO have a natural home, so coin a sensible top-level folder rather than leaving them unfiled. Group items of the SAME kind under the SAME new folder so the tree stays coherent.
-3. Only give an empty path [] when an item genuinely belongs to NO durable subject at all. This must be RARE. The absence of a matching existing folder is NOT a reason for []; create a folder instead.
+1. REUSE an existing folder's EXACT label only when its meaning and scope fit the item. A related topic or shared keyword is not enough. Never stretch a folder's meaning or put a broader topic under a narrower folder merely to reuse it.
+2. If no existing folder fits, CREATE a clear, durable topic folder. Different subjects may have separate top-level folders; do not force them into one broad umbrella or a vague catch-all such as "Other" or "Systems and Components". A distinct subject can justify a new folder even if this batch has only one item about it.
+3. Choose paths for the whole batch together. Reuse the same path for related items with the same subject; do not create a folder for every page or create synonymous folders. Do not target a fixed number of folders.
+4. A parent folder must accurately cover every child topic. Add a second level when it helps readers distinguish meaningful subtopics, rather than creating a redundant folder named after its only page. Keep sibling folders at comparable scope and use a consistent classification basis. For example, DNS forwarding and DNS authoritative zones may be siblings under DNS; authoritative zones do not belong under DNS forwarding.
+5. Only give an empty path [] when an item genuinely has no durable subject. The absence of a matching existing folder is NOT a reason for []; create a suitable folder instead.
 
 Other rules:
-- Group items of the SAME kind under the SAME folder at the SAME depth. Do not file one equivalent item a level deeper than its siblings (e.g. avoid "地点 / 地址 / Address1" next to "地点 / Address2" — pick one consistent depth for equivalent items).
-- Prefer a single broad top-level folder; add a second level only for a genuinely durable sub-domain shared by several items.
 - Do NOT use the item type ("entity"/"concept") as a folder. Do NOT put slashes inside a single label.
 - Every item slug in <items> MUST appear exactly once in the output.
 - Write ALL folder labels in {{.Language}}.

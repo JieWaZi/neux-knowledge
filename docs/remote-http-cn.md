@@ -35,3 +35,7 @@ HTTP 默认 30 秒超时，禁止自动跟随重定向，凭据不发往重定�
 新库创建丢失响应时，调用方尚不知道库身份，使用连接级 `GetCreationReceipt` 查询原 requestId。服务器仍检查当前 `CreateLibrary` 权限与写来源策略，并用原子保存的 `kb.created` 活动核对原请求、库身份和真实认证主体；仅知道请求身份不能获得其他主体的创建结果。创建 POST 的同键重放同样核对原创建主体。恢复不会自动为凭据添加新库 grant；已恢复的创建操作继续使用连接级回执查询，查无回执或无法确认归属时不重新 POST。
 
 测试覆盖真实 SQLite 双客户端读取、同旧版本 CAS 冲突、同键回放／冲突、历史恢复、人工主题、归档、原件原字节、认证范围、写 IP、转发头链、动态撤销锁、恢复认证、未知任务和取消未确认。HTTP 丢响应测试只证明不盲目重试；结构测试只证明客户端不拥有本地执行／存储依赖。这些证据不代替 NeuxAlly Web 的真实服务装配、官方在线服务或实际服务器模型验收。
+
+## 轻量页面目录
+
+`GET /api/knowledge/v1/libraries/{libraryId}/page-directory?offset=0&limit=1000` 复用库范围的读取授权，返回 `items`、`total`、`offset`、`limit`。默认及单批上限为 1000；目录条目不含正文、证据、来源和链关系。Remote SDK 使用 `Custom.ListPageDirectory`，逐条校验库身份、ID、slug、版本与重复 ID。公开集成协议映射到 `/api/v1/knowledgebase/{kb_id}/wiki/page-directory`，不回退完整页面列表。

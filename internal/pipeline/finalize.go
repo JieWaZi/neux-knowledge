@@ -12,6 +12,17 @@ import (
 
 var summaryWikiLinks = regexp.MustCompile(`\[\[[^\]]+\]\]`)
 
+// plainSummaryLinks 仅移除显式链接包装，用于判断摘要是否仍是管线原文。
+func plainSummaryLinks(body string) string {
+	return summaryWikiLinks.ReplaceAllStringFunc(body, func(match string) string {
+		parts := strings.SplitN(match[2:len(match)-2], "|", 2)
+		if len(parts) > 1 {
+			return parts[1]
+		}
+		return parts[0]
+	})
+}
+
 func stripFailedSummaryLinks(body string, failed map[string]bool, existing []*types.WikiPage) string {
 	present := map[string]bool{}
 	for _, page := range existing {

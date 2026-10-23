@@ -583,3 +583,29 @@ func validReceiptResource(v *core.Receipt) bool {
 	}
 	return v.Operation == "job.accept" && v.State == "no-op" && v.JobID == "" && len(v.PageIDs) == 0
 }
+
+// ListPageDirectory 读取自有服务的轻量目录，不以完整页面列表充当目录。
+func (c *Custom) ListPageDirectory(ctx context.Context, offset, limit int) (*CustomList[*core.PageDirectoryEntry], error) {
+	if offset < 0 || limit < 0 || limit > core.PageDirectoryMaxLimit {
+		return nil, &Error{Code: "invalid_pagination"}
+	}
+	if limit == 0 {
+		limit = core.PageDirectoryMaxLimit
+	}
+	q := url.Values{"offset": {strconv.Itoa(offset)}, "limit": {strconv.Itoa(limit)}}
+	v, err := customGet[CustomList[*core.PageDirectoryEntry]](ctx, c, "/page-directory", q, "items", "total", "offset", "limit")
+	if err != nil {
+		return nil, err
+	}
+	if v.Total < 0 || v.Offset != offset || v.Limit != limit || len(v.Items) > limit {
+		return nil, protocolError()
+	}
+	seen := map[string]bool{}
+	for _, p := range v.Items {
+		if p == nil || p.KnowledgeBaseID != c.ref.KnowledgeBaseID || p.ID == "" || p.Slug == "" || p.Version < 1 || seen[p.ID] {
+			return nil, protocolError()
+		}
+		seen[p.ID] = true
+	}
+	return v, nil
+}

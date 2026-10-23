@@ -92,6 +92,8 @@ func (c *Custom) requestIntegration(ctx context.Context, method, path string, q 
 			mapped, shape = base, "data"
 		case suffix == "/capabilities":
 			mapped = base + "/integration-capabilities"
+		case suffix == "/page-directory":
+			mapped = wiki + "/page-directory"
 		case suffix == "/pages":
 			mapped, shape = wiki+"/pages", "pages"
 			values.Set("page_type", q.Get("pageType"))

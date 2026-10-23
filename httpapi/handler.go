@@ -74,7 +74,11 @@ func decode(w http.ResponseWriter, r *http.Request, out any) error {
 	return nil
 }
 func pagination(r *http.Request) (int, int, error) {
-	o, l := 0, 50
+	return paginationLimit(r, 100, 50)
+}
+
+func paginationLimit(r *http.Request, maximum, defaultLimit int) (int, int, error) {
+	o, l := 0, defaultLimit
 	var err error
 	if s := r.URL.Query().Get("offset"); s != "" {
 		o, err = strconv.Atoi(s)
@@ -88,7 +92,7 @@ func pagination(r *http.Request) (int, int, error) {
 			return 0, 0, invalid()
 		}
 	}
-	if o < 0 || l < 1 || l > 100 {
+	if o < 0 || l < 1 || l > maximum {
 		return 0, 0, invalid()
 	}
 	return o, l, nil
@@ -367,6 +371,16 @@ func (h *Handler) libraries(w http.ResponseWriter, r *http.Request, p Principal)
 }
 func (h *Handler) read(w http.ResponseWriter, r *http.Request, p []string, lib string) {
 	ctx := r.Context()
+	if len(p) == 3 && p[2] == "page-directory" {
+		o, l, err := paginationLimit(r, core.PageDirectoryMaxLimit, core.PageDirectoryMaxLimit)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		items, total, err := h.engine.ListPageDirectory(ctx, lib, o, l)
+		respond(w, List[*core.PageDirectoryEntry]{Items: items, Total: total, Offset: o, Limit: l}, err)
+		return
+	}
 	o, l, err := pagination(r)
 	if err != nil {
 		respond(w, nil, err)

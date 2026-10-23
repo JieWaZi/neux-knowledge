@@ -25,16 +25,17 @@ import (
 
 // Store owns the knowledge database and managed source directory without starting background execution.
 type Store struct {
-	db               *gorm.DB       // Independent SQLite connection.
-	raw              *os.Root       // Managed source root protected against path traversal.
-	once             sync.Once      // Makes repeated closes safe.
-	closeErr         error          // Actual error from the first close.
-	processorDir     string         // Local stage-lock directory located by the actual database path.
-	processorMu      sync.Mutex     // Serializes the close barrier and local stage entry.
-	processorClosing bool           // Prevents acceptance of new local processing stages during close.
-	processors       sync.WaitGroup // Local processing and cancellation recovery operations that have not actually exited.
-	databaseIdentity string         // Digest of the canonical database path, identifying ownership of the managed source root.
-	rawIdentity      string         // Digest of the canonical source-root path, checked bidirectionally against the authoritative database binding.
+	transactionGate  chan struct{}  // 同实例短事务的可取消准入，避免并行阶段互相制造 SQLite busy。
+	db               *gorm.DB       // 独立知识 SQLite 连接。
+	raw              *os.Root       // 防止路径穿越的受管原件根目录。
+	once             sync.Once      // 保证重复关闭安全。
+	closeErr         error          // 首次关闭的真实错误。
+	processorDir     string         // 由真实数据库路径定位的本地阶段锁目录。
+	processorMu      sync.Mutex     // 串行关闭屏障与本地阶段接纳。
+	processorClosing bool           // 关闭期间拒绝新的本地处理阶段。
+	processors       sync.WaitGroup // 尚未实际退出的处理及取消恢复操作。
+	databaseIdentity string         // 数据库规范路径摘要，用于验证受管原件根归属。
+	rawIdentity      string         // 原件根规范路径摘要，与数据库权威绑定双向核对。
 }
 
 // Open creates the current knowledge schema and validates existing databases without changing SQLite defaults.
@@ -76,7 +77,7 @@ func Open(ctx context.Context, dbPath, rawDir string) (*Store, error) {
 		root.Close()
 		return nil, wrap(types.ErrDatabase, "open", err)
 	}
-	s := &Store{db: db, raw: root}
+	s := &Store{db: db, raw: root, transactionGate: make(chan struct{}, 1)}
 	canonical, err := filepath.Abs(dbPath)
 	if err == nil {
 		canonical, err = filepath.EvalSymlinks(canonical)
@@ -283,6 +284,12 @@ func translate(op string, err error) error {
 
 // transaction restarts the whole transaction on busy rather than replaying a single statement in an old snapshot.
 func (s *Store) transaction(ctx context.Context, fn func(*gorm.DB) error) error {
+	select {
+	case s.transactionGate <- struct{}{}:
+		defer func() { <-s.transactionGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		if err = ctx.Err(); err != nil {

@@ -30,6 +30,9 @@ func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string,
 	if err != nil {
 		return "", err
 	}
+	if st.State == "finished" && st.Outcome == "succeeded" {
+		return st.ResultText, nil
+	}
 	result := GenerateResult{}
 	var callErr error
 	var totalUsage *types.ModelUsage
@@ -90,7 +93,7 @@ func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string,
 	defer cancel()
 	finishErr := s.store.FinishModelStage(cleanup, st.ID, output.String(), result.FinishReason, diagnostic, totalUsage, result.Diagnostics)
 	if callErr != nil {
-		return "", callErr
+		return "", &modelCallError{cause: callErr}
 	}
 	if finishErr != nil {
 		return "", finishErr
@@ -117,3 +120,11 @@ func maxTokensForStage(kind string) int {
 	}
 	return wikiLLMMaxTokens
 }
+
+// modelCallError 区分模型调用失败与阶段记录或页面存储失败，决定是否值得再次消耗模型预算。
+type modelCallError struct {
+	cause error // 模型返回的原始失败，保留类型与诊断。
+}
+
+func (e *modelCallError) Error() string { return e.cause.Error() }
+func (e *modelCallError) Unwrap() error { return e.cause }

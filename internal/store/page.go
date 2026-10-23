@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -218,31 +219,68 @@ func writePageWithEdit(tx *gorm.DB, l *types.Library, p *types.WikiPage, expecte
 	} else if expected != 0 {
 		return false, fail(types.ErrVersionConflict, "page.write", "new page requires version zero")
 	}
+	if old != nil && (p.UpdatedAt.IsZero() || p.UpdatedAt.UnixMilli() != old.UpdatedAt.UnixMilli()) {
+		return false, fail(types.ErrVersionConflict, "page.write", "page read time changed or is missing")
+	}
+	var checkpoint *types.Receipt
+	if edit.job != nil && old != nil {
+		var row types.Receipt
+		err := tx.Where("request_id = ?", jobPageVersionKey(edit.job, old.ID)).Take(&row).Error
+		if err == nil {
+			checkpoint = &row
+			if row.Version != int64(old.Version) || old.LastEditSource != types.WikiEditSourcePipeline {
+				return false, fail(types.ErrVersionConflict, "page.write", "another edit superseded this job version")
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, err
+		}
+	}
 	if err := preparePage(tx, l, p, old, generated, allowed, edit); err != nil {
 		return false, err
 	}
 	p.UpdatedAt = time.Now()
+	if old != nil {
+		p.UpdatedAt = nextPageWriteTime(old.UpdatedAt)
+	}
 	if old == nil {
 		if p.ID == "" {
 			p.ID = newID()
 		}
 		p.CreatedAt = p.UpdatedAt
 		p.Version = 1
-		return p.FolderID != "", tx.Create(p).Error
+		if err := tx.Create(p).Error; err != nil {
+			return false, err
+		}
+		if edit.job != nil {
+			if err := saveJobPageVersion(tx, edit.job, p); err != nil {
+				return false, err
+			}
+		}
+		return p.FolderID != "", nil
 	}
-	if err := tx.Create(revisionOf(old)).Error; err != nil {
-		return false, err
+	advance := edit.job == nil || (checkpoint == nil && pageContentChanged(old, p))
+	if advance {
+		if err := tx.Create(revisionOf(old)).Error; err != nil {
+			return false, err
+		}
+	} else {
+		p.LastEditSource, p.LastEditorID = old.LastEditSource, old.LastEditorID
 	}
 	p.CreatedAt = old.CreatedAt
 	p.Version = expected
-	if err := updateWikiPageRow(tx, p); err != nil {
+	if err := updateWikiPageRowVersion(tx, p, advance); err != nil {
 		return false, err
+	}
+	if edit.job != nil && advance {
+		if err := saveJobPageVersion(tx, edit.job, p); err != nil {
+			return false, err
+		}
 	}
 	// CAS saves the body and derived references; additional local authoritative evidence belongs to the same transaction and version.
 	evidence, _ := json.Marshal(p.Evidence)
-	err := tx.Model(&types.WikiPage{}).Where("id = ? AND version = ?", p.ID, p.Version).Updates(map[string]any{"wiki_language": p.WikiLanguage, "evidence": string(evidence), "manual_placement": p.ManualPlacement, "protected_content": p.ProtectedContent}).Error
+	err := tx.Model(&types.WikiPage{}).Where("id = ? AND version = ?", p.ID, p.Version).UpdateColumns(map[string]any{"wiki_language": p.WikiLanguage, "evidence": string(evidence), "manual_placement": p.ManualPlacement, "protected_content": p.ProtectedContent}).Error
 	if err == nil && edit.rename {
-		err = tx.Model(&types.WikiPage{}).Where("knowledge_base_id = ? AND id = ? AND version = ?", l.ID, p.ID, p.Version).Update("slug", p.Slug).Error
+		err = tx.Model(&types.WikiPage{}).Where("knowledge_base_id = ? AND id = ? AND version = ?", l.ID, p.ID, p.Version).UpdateColumn("slug", p.Slug).Error
 	}
 	return old.FolderID != p.FolderID || old.SortOrder != p.SortOrder || old.ManualPlacement != p.ManualPlacement, err
 }
@@ -401,7 +439,7 @@ func (s *Store) GetRevision(ctx context.Context, lib, pageID string, version int
 	return
 }
 
-func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated bool) (string, error) {
+func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated bool, edit pageEdit) (string, error) {
 	t := in.Theme
 	if t.KnowledgeBaseID != "" && t.KnowledgeBaseID != l.ID {
 		return "", fail(types.ErrScopeViolation, "theme.write", "theme belongs to another library")
@@ -516,7 +554,7 @@ func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated
 			if generated && p.ManualPlacement && old.Path != t.Path {
 				return "", fail(types.ErrManualProtected, "theme.write", "manual page path is protected")
 			}
-			if _, err := writePage(tx, l, p, p.Version, generated, nil); err != nil {
+			if _, err := writePageWithEdit(tx, l, p, p.Version, generated, nil, edit); err != nil {
 				return "", err
 			}
 		}
@@ -537,7 +575,7 @@ func (s *Store) WriteTheme(ctx context.Context, in types.WriteThemeInput) (*type
 		if l.StructureVersion != in.StructureVersion {
 			return nil, fail(types.ErrVersionConflict, "theme.write", "structure changed")
 		}
-		id, err := applyTheme(tx, l, types.ThemeMutation{Theme: in.Theme, Delete: in.Delete}, false)
+		id, err := applyTheme(tx, l, types.ThemeMutation{Theme: in.Theme, Delete: in.Delete}, false, pageEdit{})
 		if err != nil {
 			return nil, err
 		}
@@ -555,6 +593,67 @@ func (s *Store) ListThemes(ctx context.Context, lib string) (items []*types.Wiki
 			return e
 		}
 		return tx.Where("knowledge_base_id = ?", lib).Order("depth ASC, sort_order ASC, name ASC, id ASC").Find(&items).Error
+	})
+	return
+}
+
+// pageContentChanged 只把用户可见内容差异作为整理内容版本，不把引用与目录缓存算作新版本。
+func pageContentChanged(old, page *types.WikiPage) bool {
+	return old.Title != page.Title || old.Content != page.Content || old.Summary != page.Summary || old.PageType != page.PageType || old.Status != page.Status || !slices.Equal(old.Aliases, page.Aliases)
+}
+
+// nextPageWriteTime 在毫秒精度保持严格递增，前端和命令调用者可原样回传读取时间。
+func nextPageWriteTime(previous time.Time) time.Time {
+	now := time.Now().UnixMilli()
+	if now <= previous.UnixMilli() {
+		now = previous.UnixMilli() + 1
+	}
+	return time.UnixMilli(now)
+}
+
+// jobPageVersionKey 跨任务尝试保持同一身份；回执与页面同事务提交，恢复不依赖内存状态。
+func jobPageVersionKey(job *types.Job, pageID string) string {
+	return "wiki/job-version/" + digest([]string{job.LibraryID, job.ID, pageID})
+}
+
+// saveJobPageVersion 固定本次整理首次创建的内容版本，后续批次只能继续写入该版本。
+func saveJobPageVersion(tx *gorm.DB, job *types.Job, page *types.WikiPage) error {
+	key := jobPageVersionKey(job, page.ID)
+	return tx.Create(&types.Receipt{RequestID: key, Digest: digest(key), Operation: "wiki.job-version", LibraryID: job.LibraryID, ResourceID: page.ID, JobID: job.ID, JobAttempt: job.Attempt, Version: int64(page.Version), State: "saved", PageIDs: []string{page.ID}, CreatedAt: time.Now().UnixMilli()}).Error
+}
+
+// ListPageDirectory 在短读事务内取得完整总数与稳定窗口，仅投影导航所需列。
+func (s *Store) ListPageDirectory(ctx context.Context, libraryID string, offset, limit int) (items []*types.WikiPageDirectoryEntry, total int64, err error) {
+	if offset < 0 || limit < 0 || limit > types.PageDirectoryMaxLimit {
+		return nil, 0, fail(types.ErrInvalid, "page.directory", "invalid pagination")
+	}
+	if limit == 0 {
+		limit = types.PageDirectoryMaxLimit
+	}
+	items = []*types.WikiPageDirectoryEntry{}
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		if _, e := getLibrary(tx, libraryID, false); e != nil {
+			return e
+		}
+		query := tx.Model(&types.WikiPage{}).Where("knowledge_base_id = ? AND status <> ?", libraryID, "archived")
+		if e := query.Count(&total).Error; e != nil {
+			return e
+		}
+		items = []*types.WikiPageDirectoryEntry{}
+		return query.Select("id", "knowledge_base_id", "slug", "title", "page_type", "summary", "folder_id", "category_path", "sort_order", "version").Order("updated_at DESC, id ASC").Offset(offset).Limit(limit).Find(&items).Error
+	})
+	return
+}
+
+// CountPagesByTheme 复用单表分组统计，不为每个目录读取完整页面。
+func (s *Store) CountPagesByTheme(ctx context.Context, libraryID string) (counts map[string]int64, err error) {
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		if _, e := getLibrary(tx, libraryID, false); e != nil {
+			return e
+		}
+		var e error
+		counts, e = (&wikiPageRepository{db: tx}).CountPagesByFolder(ctx, libraryID, nil)
+		return e
 	})
 	return
 }

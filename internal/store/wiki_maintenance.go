@@ -16,9 +16,10 @@ import (
 
 // pageEdit is constructed only by verified maintenance use cases; models cannot directly set origins or protection policies.
 type pageEdit struct {
-	agent   bool                // Whether this write comes from explicit agent maintenance.
-	rename  bool                // Whether this operation may change the slug while retaining a stable identity.
-	rewrite func(string) string // Precisely transforms existing protected fragments, leaving unmatched fragments unchanged.
+	agent   bool                // 是否来自显式智能体维护。
+	rename  bool                // 是否允许保留页面身份并修改地址。
+	rewrite func(string) string // 对人工保护片段的精确变换，未命中内容保持原样。
+	job     *types.Job          // 已验证的整理任务，用于合并同一任务的内容版本。
 }
 
 func maintenanceLibrary(tx *gorm.DB, lib string, structure, policy int64) (*types.Library, error) {

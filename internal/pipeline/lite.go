@@ -63,7 +63,26 @@ func Run(ctx context.Context, s *store.Store, in Input) (*Result, error) {
 			return nil, err
 		}
 		if acquired {
-			break
+			// 库锁与持久队首先后核对，重启时即使后续任务先获得调度也不能插队。
+			current, readErr := s.GetJob(ctx, j.ID)
+			if readErr != nil {
+				release()
+				return nil, readErr
+			}
+			if current.State == "completed" || current.State == "partial_failed" || current.State == "failed" || current.State == "cancelled" {
+				release()
+				return &Result{JobID: current.ID, State: current.State}, nil
+			}
+			var ready bool
+			j, ready, err = s.ActivateQueuedJob(ctx, j.ID)
+			if err != nil {
+				release()
+				return nil, err
+			}
+			if ready {
+				break
+			}
+			release()
 		}
 		// A Lite batch lock conflict must not lose accepted tasks; wait for the holder to exit before reading the authoritative final state.
 		if err = waitContext(ctx, 50*time.Millisecond); err != nil {
@@ -180,13 +199,13 @@ func (s *liteService) lockPublication(ctx context.Context) (func(), error) {
 	}
 	return s.commitMu.Unlock, nil
 }
-func (s *liteService) publish(ctx context.Context, name string, p *types.Publication) (*types.Receipt, error) {
+func (s *liteService) publish(ctx context.Context, name string, p *types.Publication, contributionKeys ...string) (*types.Receipt, error) {
 	release, err := s.lockPublication(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	rec, err := s.store.PublishLite(ctx, s.key(name), s.job.ID, s.job.Attempt, p)
+	rec, err := s.store.PublishLite(ctx, s.key(name), s.job.ID, s.job.Attempt, p, contributionKeys...)
 	if err == nil && s.input.OnPublished != nil {
 		s.input.OnPublished(ctx, rec)
 	}
@@ -226,6 +245,25 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 		}
 	}
 	updates = s.remapSlugUpdatesByIdentity(ctx, s.job.LibraryID, updates, s.newBatchContext(pages))
+	// 仅缺失的来源贡献进入目录规划与 Reduce，已提交页面不重新调用模型。
+	for slug, list := range updates {
+		pending := []SlugUpdate{}
+		for _, u := range list {
+			applied, e := s.store.HasLiteContribution(ctx, s.job.ID, hash(marshal(u)))
+			if e != nil {
+				return e
+			}
+			if applied {
+				continue
+			}
+			pending = append(pending, u)
+		}
+		if len(pending) == 0 {
+			delete(updates, slug)
+		} else {
+			updates[slug] = pending
+		}
+	}
 	folders, themes := s.planTaxonomy(ctx, updates)
 	if len(themes) > 0 {
 		if _, err = s.publish(ctx, "folders/"+hash(marshal(themes)), &types.Publication{Themes: themes}); err != nil {
@@ -234,8 +272,6 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 	}
 	slugs := sortedKeys(updates)
 	reduceErrors := make([]error, len(slugs))
-	failedAddition := map[string]bool{}
-	var failedMu sync.Mutex
 	parallel(ctx, len(slugs), s.library.WikiConfig.IngestReduceParallelOrDefault(wikiReduceParallel), func(i int) {
 		slug := slugs[i]
 		defer func() {
@@ -248,15 +284,16 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 		batchCtx.PlannedFolderID = folders
 		_, _, additionFailed, deferred, e := reducer.reduceSlugUpdates(ctx, s.job.LibraryID, slug, updates[slug], batchCtx)
 		if e == nil && (deferred || reducer.deferred) {
-			e = invalid("wiki contribution was not applied")
+			e = &types.Error{Code: types.ErrManualProtected, Operation: "lite.page.rows", Detail: slug + ": wiki rewrite dropped table rows"}
+		}
+		if e == nil && additionFailed {
+			e = invalid(slug + ": page generation failed")
+		}
+		if e != nil {
+			e = fmt.Errorf("page %s: %w", slug, e)
 		}
 
 		reduceErrors[i] = e
-		if e != nil || additionFailed {
-			failedMu.Lock()
-			failedAddition[slug] = true
-			failedMu.Unlock()
-		}
 	})
 	if err = ctx.Err(); err != nil {
 		return err
@@ -269,21 +306,45 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 			}
 		}
 	}
-	// Summary links retain only knowledge pages that actually exist; a page failure must not leave dangling links.
-	if len(failedAddition) > 0 {
+	// 用已完成计划恢复原显式链接，不再次生成摘要；人工正文或保护片段保持原样。
+	if s.library.IndexingStrategy.WikiEnabled {
+		currentPages, e := s.pages(ctx)
+		if e != nil {
+			return e
+		}
 		for _, result := range results {
-			if result == nil || !s.library.IndexingStrategy.WikiEnabled {
+			if result == nil {
 				continue
 			}
 			current, e := s.store.GetPageBySlug(ctx, s.job.LibraryID, result.summary.Page.Slug)
 			if e != nil {
+				var missing *types.Error
+				if errors.As(e, &missing) && missing.Code == types.ErrNotFound {
+					continue
+				}
+				return e
+			}
+			if current.LastEditSource != types.WikiEditSourcePipeline || len(current.ProtectedContent) > 0 {
 				continue
 			}
-			cleaned := stripFailedSummaryLinks(current.Content, failedAddition, pages)
+			body := current.Content
+			if plainSummaryLinks(body) == plainSummaryLinks(result.summary.Page.Content) {
+				body = result.summary.Page.Content
+			}
+			candidates := map[string]bool{}
+			for _, slug := range wiki.ParseOutLinks(body) {
+				candidates[slug] = true
+			}
+			cleaned := stripFailedSummaryLinks(body, candidates, currentPages)
 			if cleaned != current.Content {
 				current.Content = cleaned
-				mutation := types.PageMutation{Page: *current, ExpectedVersion: current.Version}
-				if _, err = s.publish(ctx, "sanitize/"+hash(marshal(mutation)), &types.Publication{Pages: []types.PageMutation{mutation}}); err != nil {
+				release, e := s.lockPublication(ctx)
+				if e != nil {
+					return e
+				}
+				err = s.store.UpdateWikiMaintenance(ctx, s.job.ID, s.job.Attempt, current, current.Version)
+				release()
+				if err != nil {
 					return err
 				}
 			}
@@ -319,6 +380,15 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 		var unavailable *types.Error
 		if errors.As(e, &unavailable) && unavailable.Code == types.ErrSourceUnavailable {
 			if _, err = s.publish(ctx, "unavailable/"+work[i].SourceVersionID, &types.Publication{Sources: []types.SourceConclusion{{SourceVersionID: work[i].SourceVersionID, State: "failed", Diagnostic: e.Error()}}}); err != nil {
+				return err
+			}
+			continue
+		}
+		var refused *types.Error
+		var modelFailure *modelCallError
+		permanentModel := errors.As(e, &modelFailure) && !isTransientLLMError(ctx, modelFailure.cause)
+		if permanentModel || (errors.As(e, &refused) && (refused.Code == types.ErrManualProtected || refused.Code == types.ErrCandidateInvalid)) {
+			if _, err = s.publish(ctx, "refused/"+work[i].SourceVersionID, &types.Publication{Sources: []types.SourceConclusion{{SourceVersionID: work[i].SourceVersionID, State: "failed", Diagnostic: e.Error()}}}); err != nil {
 				return err
 			}
 			continue
@@ -360,6 +430,18 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 	source, err := s.store.GetSource(ctx, s.job.LibraryID, w.SourceVersionID)
 	if err != nil {
 		return nil, err
+	}
+	if payload, e := s.store.LoadLitePlan(ctx, s.job.ID, s.job.Attempt, source.ID); e != nil {
+		return nil, e
+	} else if payload != "" {
+		var plan documentPlan
+		if e = json.Unmarshal([]byte(payload), &plan); e != nil {
+			return nil, invalid("stored document plan is invalid")
+		}
+		if plan.Artifact.SourceVersionID != source.ID || plan.Artifact.SHA256 != source.SHA256 {
+			return nil, invalid("stored document plan source changed")
+		}
+		return &docIngestResult{source: source, artifact: plan.Artifact, updates: plan.Updates, summary: plan.Summary, description: plan.Description, profile: plan.Profile}, nil
 	}
 	raw, err := s.store.ReadRaw(ctx, s.job.LibraryID, source.ID)
 	if err != nil {
@@ -451,7 +533,24 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 			result.updates[update.Slug] = append(result.updates[update.Slug], update)
 		}
 	}
+	plan := documentPlan{Artifact: result.artifact, Updates: result.updates, Summary: result.summary, Description: result.description, Profile: result.profile}
+	if err = s.store.SaveLitePlan(ctx, s.job.ID, s.job.Attempt, source.ID, string(marshal(plan))); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// documentPlan 是可信管线的恢复结果，不是额外模型调用或新的知识事实。
+type documentPlan struct {
+	Artifact    ReadArtifact            // 已完成的原件阅读与分块。
+	Updates     map[string][]SlugUpdate // 按页面整理的不可变来源贡献。
+	Summary     types.PageMutation      // 原件摘要的初始发布内容。
+	Description string                  // 来源的一句话说明。
+	Profile     *types.KnowledgeProfile // 非 Wiki 文档的知识档案。
+}
+
+func (s *liteService) contributionKey(update SlugUpdate) string {
+	return "lite/" + s.job.ID + "/applied/" + hash(marshal(update))
 }
 
 // combinedExtraction preserves the upstream JSON contract without adding a host result wrapper.

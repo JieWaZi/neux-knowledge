@@ -99,6 +99,9 @@ func (s *upstreamReducer) reduceSlugUpdates(ctx context.Context, kbID, slug stri
 			// the page version.
 			_, writeErr := s.UpdatePage(ctx, page)
 			updateDeferred, err = classifyWikiPageWrite(writeErr)
+			if updateDeferred {
+				err = writeErr
+			}
 		} else {
 			_, err = s.CreatePage(ctx, page)
 		}
@@ -328,10 +331,7 @@ func (s *upstreamReducer) reduceSlugUpdates(ctx context.Context, kbID, slug stri
 			if len(additions) > 0 {
 				additionFailed = true
 			}
-			// Don't propagate the LLM error to the named return: it has
-			// already been logged, and the eg.Go caller would otherwise
-			// log it a second time as "reduce failed for slug".
-			err = nil
+			return false, affectedType, additionFailed, false, err
 		}
 	}
 
@@ -375,6 +375,9 @@ func (s *upstreamReducer) reduceSlugUpdates(ctx context.Context, kbID, slug stri
 			// classified as deferred.
 			_, updateErr := s.UpdatePage(writeCtx, page)
 			updateDeferred, err = classifyWikiPageWrite(updateErr)
+			if updateDeferred {
+				err = updateErr
+			}
 		} else {
 			_, err = s.CreatePage(ctx, page)
 		}
@@ -471,7 +474,7 @@ func (s *upstreamReducer) UpdatePage(ctx context.Context, page *types.WikiPage) 
 			missing := wiki.MissingRowIdentities(old.Content, page.Content)
 			if len(missing) > 0 && wiki.RowIdentityLossRatio(len(missing), wiki.UniqueRowIdentityCount(old.Content)) > .20 {
 				s.deferred = true
-				return nil, &types.Error{Code: types.ErrManualProtected, Operation: "lite.page.rows", Detail: "wiki rewrite dropped table rows"}
+				return nil, &types.Error{Code: types.ErrManualProtected, Operation: "lite.page.rows", Detail: fmt.Sprintf("%s: wiki rewrite dropped %d of %d table rows", page.Slug, len(missing), wiki.UniqueRowIdentityCount(old.Content))}
 			}
 		}
 	}
@@ -516,7 +519,11 @@ func (s *upstreamReducer) savePage(ctx context.Context, page *types.WikiPage, ex
 	}
 	page.SourceRefs = nil
 	mutation := types.PageMutation{Page: *page, ExpectedVersion: expected}
-	_, err := s.publish(ctx, "page/"+hash(marshal(mutation)), &types.Publication{Pages: []types.PageMutation{mutation}, SourceVersionIDs: sourceIDsFor(s.updates)})
+	keys := make([]string, 0, len(s.updates))
+	for _, u := range s.updates {
+		keys = append(keys, s.contributionKey(u))
+	}
+	_, err := s.publish(ctx, "page/"+hash(marshal(mutation)), &types.Publication{Pages: []types.PageMutation{mutation}, SourceVersionIDs: sourceIDsFor(s.updates)}, keys...)
 	return page, err
 }
 func classifyWikiPageWrite(err error) (bool, error) {

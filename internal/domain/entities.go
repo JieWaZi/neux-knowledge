@@ -25,6 +25,8 @@ func (Library) TableName() string { return "knowledge_libraries" }
 
 // SourceVersion stores immutable original identity and mutable processing state; original bytes are stored separately in the managed directory.
 type SourceVersion struct {
+	// OrganizeBlocked 由活动任务按原件身份投影，只限制再次接纳，不改变真实处理结果。
+	OrganizeBlocked bool `json:"organizeBlocked,omitempty" gorm:"-"`
 	// Description 保存普通文档分析生成的简短摘要。
 	Description string `json:"description,omitempty"`
 	// Profile 保存规范化的主题、类型及问题，不包含完整原文。

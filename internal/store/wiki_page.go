@@ -134,8 +134,15 @@ func (r *wikiPageRepository) UpdateWithRevision(
 // (plain connection or transaction). On failure page.Version is restored so
 // the caller never observes a bumped version for a write that did not land.
 func updateWikiPageRow(db *gorm.DB, page *types.WikiPage) error {
+	return updateWikiPageRowVersion(db, page, true)
+}
+
+// updateWikiPageRowVersion 将内部写入与内容版本递增分开，同一整理任务的中间写入可保留当前版本。
+func updateWikiPageRowVersion(db *gorm.DB, page *types.WikiPage, advance bool) error {
 	expectedVersion := page.Version
-	page.Version = expectedVersion + 1
+	if advance {
+		page.Version++
+	}
 
 	result := db.
 		Model(page).
@@ -176,7 +183,16 @@ func updateWikiPageRow(db *gorm.DB, page *types.WikiPage) error {
 		}
 		return ErrWikiPageConflict
 	}
+	if err := pruneWrittenRevisions(db, page.ID, page.Version); err != nil {
+		page.Version = expectedVersion
+		return err
+	}
 	return nil
+}
+
+// pruneWrittenRevisions 在实际写入事务内统一保留最多 50 个版本（含当前页），读取历史不会触发删除。
+func pruneWrittenRevisions(tx *gorm.DB, pageID string, version int) error {
+	return NewWikiPageRepository(tx).PruneRevisions(tx.Statement.Context, types.WikiRevisionPruneRequest{PageID: pageID, HardKeepFromVersion: version - types.WikiMaxRevisionsPerPage + 1})
 }
 
 // wikiRevisionListColumns is the projection for revision listings — every
@@ -263,14 +279,14 @@ func (r *wikiPageRepository) DeleteRevisionsByPage(ctx context.Context, pageID s
 		Delete(&types.WikiPageRevision{}).Error
 }
 
-// UpdateAutoLinkedContent also uses CAS and history for link convergence; old model text cannot overwrite new manual edits.
+// UpdateAutoLinkedContent 仅维护自动链接，通过版本与读取时间拒绝旧结果，不新增内容版本。
 func (r *wikiPageRepository) UpdateAutoLinkedContent(ctx context.Context, page *types.WikiPage) error {
 	return updateWikiMaintenance(r.db.WithContext(ctx), page, map[string]any{
 		"content": page.Content, "out_links": page.OutLinks, "updated_at": page.UpdatedAt,
 	})
 }
 
-// UpdateMeta applies the same version barrier to metadata and placement as to the body, preventing bypasses of concurrency protection.
+// UpdateMeta 维护派生元数据，保留内容版本并校验读取时间，避免同一内容版本内的写入互相覆盖。
 func (r *wikiPageRepository) UpdateMeta(ctx context.Context, page *types.WikiPage) error {
 	return updateWikiMaintenance(r.db.WithContext(ctx), page, map[string]any{
 		"in_links": page.InLinks, "out_links": page.OutLinks, "aliases": page.Aliases,
@@ -291,24 +307,21 @@ func updateWikiMaintenance(db *gorm.DB, page *types.WikiPage, fields map[string]
 			}
 			return err
 		}
-		if current.Version != expected {
+		if current.Version != expected || current.UpdatedAt.UnixMilli() != page.UpdatedAt.UnixMilli() {
 			return ErrWikiPageConflict
 		}
-		if err := tx.Create(revisionOf(&current)).Error; err != nil {
-			return err
-		}
-		fields["version"] = expected + 1
-		result := tx.Model(&types.WikiPage{}).Where("id = ? AND version = ?", page.ID, expected).Updates(fields)
+		fields["updated_at"] = nextPageWriteTime(current.UpdatedAt)
+		result := tx.Model(&types.WikiPage{}).Where("id = ? AND version = ? AND updated_at = ?", page.ID, expected, current.UpdatedAt).Updates(fields)
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return ErrWikiPageConflict
 		}
-		return nil
+		return pruneWrittenRevisions(tx, page.ID, expected)
 	})
 	if err == nil {
-		page.Version = expected + 1
+		page.UpdatedAt = fields["updated_at"].(time.Time)
 	}
 	return err
 }

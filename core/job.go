@@ -42,7 +42,7 @@ func (e *Engine) FailJob(ctx context.Context, in FailJobInput) (*Receipt, error)
 	return e.store.FailJob(ctx, in)
 }
 
-// GetActiveJob returns the library's sole slot-occupying job, or nil when none is active.
+// GetActiveJob 返回库内正在执行或下一位等待执行的任务；队列为空时返回 nil。
 func (e *Engine) GetActiveJob(ctx context.Context, libraryID string) (*Job, error) {
 	return e.store.GetActiveJob(ctx, libraryID)
 }
