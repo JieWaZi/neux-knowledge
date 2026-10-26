@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,12 +41,46 @@ func activeJob(tx *gorm.DB, id string) (*types.Job, *types.Library, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if l.PolicyVersion != j.Permission.PolicyVersion || !hasOperation(j.Permission, "organize") {
+	operation := "organize"
+	if types.IsMaintenanceJob(j) {
+		operation = "maintain"
+	}
+	if l.PolicyVersion != j.Permission.PolicyVersion || !hasOperation(j.Permission, operation) {
 		return nil, nil, fail(types.ErrScopeViolation, "job", "accepted permission is no longer valid")
 	}
 	return j, l, nil
 }
+
+// checkMaintenanceWrite 在实际写事务内复核独立 ACP 的任务屏障；回执重放也不能越过撤销。
+func checkMaintenanceWrite(ctx context.Context, tx *gorm.DB, operation, libraryID string) error {
+	scope, ok := types.MaintenanceJobFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	job, _, err := activeJob(tx, scope.JobID)
+	if err != nil {
+		return err
+	}
+	if !types.IsMaintenanceJob(job) || libraryID != "" && libraryID != job.LibraryID {
+		return fail(types.ErrScopeViolation, operation, "write does not belong to the frozen Wiki maintenance task")
+	}
+	if job.Attempt != scope.Attempt {
+		return fail(types.ErrStaleAttempt, operation, "maintenance attempt changed")
+	}
+	if job.State != "processing" {
+		return fail(types.ErrVersionConflict, operation, "maintenance task has not started")
+	}
+	switch operation {
+	case "page.agent-write", "page.replace-text", "page.rename", "page.delete", "page.restore", "theme.write", "wiki.auto-fix", "wiki.maintenance.complete":
+		return nil
+	default:
+		return fail(types.ErrScopeViolation, operation, "maintenance cannot process originals or change library policy")
+	}
+}
 func validateFrozenSources(tx *gorm.DB, j *types.Job) error {
+	if types.IsMaintenanceJob(j) {
+		return nil
+	}
 	if len(j.SourceVersionIDs) == 0 {
 		return fail(types.ErrInvalid, "job.sources", "job has no frozen sources")
 	}
@@ -160,11 +195,60 @@ func (s *Store) ActivateQueuedJob(ctx context.Context, jobID string) (result *ty
 				return fail(types.ErrVersionConflict, "job.activate", "job changed before activation")
 			}
 			j.State, j.StructureVersion, j.Version = "processing", lib.StructureVersion, j.Version+1
+			if types.IsMaintenanceJob(j) {
+				now := time.Now().UnixMilli()
+				stage := types.Stage{ID: newID(), JobID: j.ID, Name: "wiki_maintenance", Kind: "wiki_maintenance", JobAttempt: j.Attempt, Attempt: 1, Version: 1, State: "running", CreatedAt: now}
+				if err := tx.Create(&stage).Error; err != nil {
+					return err
+				}
+			}
 		}
 		result, ready = j, true
 		return nil
 	})
 	return
+}
+
+// CompleteMaintenanceJob 保存独立原生工具循环的真实终态与报告，来源状态保持原值。
+func (s *Store) CompleteMaintenanceJob(ctx context.Context, in types.JobActionInput, report string) (*types.Receipt, error) {
+	input := struct {
+		Action types.JobActionInput // 原接纳任务及读取的版本。
+		Report string               // ACP 成功返回的实际最终报告。
+	}{Action: in, Report: report}
+	return s.mutate(ctx, in.RequestID, "wiki.maintenance.complete", "", input, func(tx *gorm.DB) (*types.Receipt, error) {
+		job, _, err := activeJob(tx, in.JobID)
+		if err != nil {
+			return nil, err
+		}
+		if !types.IsMaintenanceJob(job) || job.State != "processing" {
+			return nil, fail(types.ErrInvalid, "wiki.maintenance.complete", "only active Wiki maintenance can complete")
+		}
+		if scope, scoped := types.MaintenanceJobFromContext(ctx); scoped && scope.JobID != job.ID {
+			return nil, fail(types.ErrScopeViolation, "wiki.maintenance.complete", "completion belongs to another maintenance task")
+		}
+		if job.Version != in.ExpectedVersion {
+			return nil, fail(types.ErrVersionConflict, "wiki.maintenance.complete", "job changed")
+		}
+		if strings.TrimSpace(report) == "" {
+			return nil, fail(types.ErrInvalid, "wiki.maintenance.complete", "actual maintenance report is required")
+		}
+		now := time.Now().UnixMilli()
+		updated := tx.Model(&types.Stage{}).Where("job_id = ? AND job_attempt = ? AND kind = ? AND state = ?", job.ID, job.Attempt, "wiki_maintenance", "running").Updates(map[string]any{"state": "finished", "outcome": "succeeded", "completeness": "complete", "result_text": report, "finished_at": now})
+		if updated.Error != nil {
+			return nil, updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return nil, fail(types.ErrVersionConflict, "wiki.maintenance.complete", "maintenance stage changed")
+		}
+		updated = tx.Model(&types.Job{}).Where("id = ? AND version = ? AND state = ? AND cancel_requested = ?", job.ID, job.Version, "processing", false).Updates(map[string]any{"state": "completed", "diagnostic": "", "version": job.Version + 1, "updated_at": now})
+		if updated.Error != nil {
+			return nil, updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return nil, fail(types.ErrVersionConflict, "wiki.maintenance.complete", "job changed")
+		}
+		return &types.Receipt{LibraryID: job.LibraryID, ResourceID: job.ID, JobID: job.ID, Version: job.Version + 1, State: "completed"}, nil
+	})
 }
 
 // AcceptJob persists only the frozen scope and sources; it does not execute models.
@@ -177,7 +261,14 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 		if l.Version != in.ExpectedVersion || l.StructureVersion != in.StructureVersion {
 			return nil, fail(types.ErrVersionConflict, "job.accept", "library or structure changed")
 		}
-		if in.Permission.PolicyVersion != l.PolicyVersion || !hasOperation(in.Permission, "organize") {
+		operation := "organize"
+		if in.Maintenance {
+			operation = "maintain"
+			if in.Rebuild || len(in.SourceVersionIDs) != 0 || len(in.Permission.Operations) != 1 || !l.IndexingStrategy.WikiEnabled {
+				return nil, fail(types.ErrInvalid, "job.accept", "Wiki maintenance requires Wiki indexing, no sources, and maintain-only permission")
+			}
+		}
+		if in.Permission.PolicyVersion != l.PolicyVersion || !hasOperation(in.Permission, operation) {
 			return nil, fail(types.ErrScopeViolation, "job.accept", "organize permission is required")
 		}
 		if strings.TrimSpace(in.RulesVersion) == "" || strings.TrimSpace(in.ConfigDigest) == "" {
@@ -185,6 +276,18 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 		}
 		if err := types.ValidateOrganizeLibrary(l); err != nil {
 			return nil, err
+		}
+		if in.Maintenance {
+			admittedAt, err := queueAdmissionTime(tx, l.ID)
+			if err != nil {
+				return nil, err
+			}
+			now := time.Now().UnixMilli()
+			job := types.Job{ActivityActor: types.ActivityActorFromContext(ctx), ID: newID(), LibraryID: l.ID, RequestID: in.RequestID, State: "queued", Attempt: 1, Version: 1, StructureVersion: l.StructureVersion, Permission: in.Permission, RulesVersion: in.RulesVersion, ConfigDigest: in.ConfigDigest, LibrarySnapshot: l, AttemptStartedAt: admittedAt, CreatedAt: now, UpdatedAt: now}
+			if err := tx.Create(&job).Error; err != nil {
+				return nil, err
+			}
+			return &types.Receipt{ResourceID: job.ID, JobID: job.ID, Version: job.Version, State: "accepted"}, nil
 		}
 		seen := map[string]bool{}
 		for _, id := range in.SourceVersionIDs {
@@ -326,7 +429,11 @@ func settleCancelledJob(tx *gorm.DB, j *types.Job) error {
 	}
 	j.Version++
 	j.State = state
-	return nil
+	// 原生阶段结束或恢复后才真正释放取消任务；同事务写入本次尝试唯一的终态活动。
+	return appendMutationActivity(tx.Statement.Context, tx, &types.Receipt{
+		RequestID: "job.cancel-settled/" + j.ID + "/" + strconv.Itoa(j.Attempt),
+		Operation: "stage.outcome", LibraryID: j.LibraryID, ResourceID: j.ID, JobID: j.ID, State: state,
+	}, nil)
 }
 
 // RetryJob accepts a failed task again without expanding permissions or discarding earlier stage audits.
@@ -498,6 +605,11 @@ func (s *Store) FailJob(ctx context.Context, in types.FailJobInput) (*types.Rece
 		state := "failed"
 		if published > 0 {
 			state = "partial_failed"
+		}
+		if types.IsMaintenanceJob(j) {
+			if err := tx.Model(&types.Stage{}).Where("job_id = ? AND job_attempt = ? AND kind = ? AND state = ?", j.ID, j.Attempt, "wiki_maintenance", "running").Updates(map[string]any{"state": "finished", "outcome": "failed", "diagnostic": in.Diagnostic, "finished_at": time.Now().UnixMilli()}).Error; err != nil {
+				return nil, err
+			}
 		}
 		r := tx.Model(&types.Job{}).Where("id = ? AND version = ? AND cancel_requested = ?", j.ID, j.Version, false).Updates(map[string]any{"state": state, "diagnostic": in.Diagnostic, "version": j.Version + 1, "updated_at": time.Now().UnixMilli()})
 		if r.Error != nil {

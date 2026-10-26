@@ -88,17 +88,19 @@ type WriteThemeInput struct {
 
 // AcceptJobInput pins sources and authorization for organization without starting a model.
 type AcceptJobInput struct {
-	// Rebuild explicitly rebuilds parsing artifacts for selected sources; omission preserves ordinary organization and prior request digests.
+	// Maintenance 明确接纳已有 Wiki 的独立维护，不选择或重新处理原件。
+	Maintenance bool `json:"maintenance,omitempty"`
+	// Rebuild 明确重建已选择原件的解析产物；省略时保留普通整理和原请求摘要。
 	Rebuild              bool               `json:"rebuild,omitempty"`
-	EmbeddingFingerprint string             // Endpoint and model fingerprint frozen when vectors are enabled.
-	RequestID            string             // Idempotent request identifier.
-	LibraryID            string             // Target library.
-	ExpectedVersion      int64              // Library version at acceptance.
-	StructureVersion     int64              // Directory generation at acceptance.
-	SourceVersionIDs     []string           // Explicitly frozen source version set.
-	Permission           PermissionSnapshot // Scope and permissions validated by the host.
-	RulesVersion         string             // Pinned rule version.
-	ConfigDigest         string             // Pinned pipeline configuration digest.
+	EmbeddingFingerprint string             // 向量服务及模型空间的冻结指纹。
+	RequestID            string             // 稳定幂等接纳身份。
+	LibraryID            string             // 目标知识库。
+	ExpectedVersion      int64              // 接纳时读取的知识库版本。
+	StructureVersion     int64              // 接纳时读取的目录版本。
+	SourceVersionIDs     []string           // 原件整理冻结的来源版本；Wiki 维护必须为空。
+	Permission           PermissionSnapshot // 宿主已核查的范围及权限快照。
+	RulesVersion         string             // 接纳时固定的规则版本。
+	ConfigDigest         string             // 接纳时固定的执行配置摘要。
 }
 
 // JobActionInput protects job state during cancellation and retry.

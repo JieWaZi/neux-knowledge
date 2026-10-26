@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 	"github.com/JieWaZi/neux-knowledge/internal/wiki"
@@ -196,21 +195,11 @@ func (s *liteService) deduplicateExtractedBatch(
 		return stabilize()
 	}
 
-	dedupeJSON, err := s.generate(ctx, "dedup", sourceID, []string{sourceID}, wiki.WikiDeduplicationPrompt, map[string]string{
-		"Candidates": candBuf.String(),
-	})
-	if err != nil {
-		logWarnf(ctx, "wiki ingest: deduplication LLM call failed: %v", err)
-		return stabilize()
-	}
-
-	dedupeJSON = cleanLLMJSON(dedupeJSON)
-
 	var dedupeResult struct {
-		Merges map[string]string `json:"merges"`
+		Merges map[string]string `json:"merges"` // 候选地址到已确认同一知识地址的合并映射。
 	}
-	if err := json.Unmarshal([]byte(dedupeJSON), &dedupeResult); err != nil {
-		logWarnf(ctx, "wiki ingest: failed to parse dedup JSON: %v\nRaw: %s", err, dedupeJSON)
+	if err := s.generateJSON(ctx, "dedup", sourceID, []string{sourceID}, wiki.WikiDeduplicationPrompt, map[string]string{"Candidates": candBuf.String()}, &dedupeResult); err != nil {
+		logWarnf(ctx, "wiki ingest: deduplication failed: %v", err)
 		return stabilize()
 	}
 

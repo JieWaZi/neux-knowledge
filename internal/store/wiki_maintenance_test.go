@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 
+	"gorm.io/gorm"
+
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 )
 
@@ -182,6 +184,62 @@ func TestWikiMaintenanceRecordsOneCommittedActivityPerRequest(t *testing.T) {
 			if err = json.Unmarshal(activity.Details, &details); err != nil || details["count"] != wantCount {
 				t.Fatalf("affected page count lost: %s error=%v", activity.Details, err)
 			}
+			if wantCount == 1 && details["title"] != "Old" {
+				t.Fatalf("single-page title missing: %s", activity.Details)
+			}
+			if wantCount == 2 {
+				titles, ok := details["titles"].([]any)
+				if !ok || len(titles) != 2 || !((titles[0] == "Old" && titles[1] == "Incoming") || (titles[0] == "Incoming" && titles[1] == "Old")) {
+					t.Fatalf("changed and soft-deleted page titles missing: %s", activity.Details)
+				}
+			}
 		})
+	}
+}
+
+// TestWikiActivityTitlePreviewIsBounded 验证多页回执只保存有限名称并保留真实变更数量。
+func TestWikiActivityTitlePreviewIsBounded(t *testing.T) {
+	s, l, _, _ := sourceWorkFixture(t)
+	ctx := context.Background()
+	ids := []string{}
+	for _, slug := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		r, err := s.WriteAgentPage(ctx, types.WritePageInput{RequestID: "preview-" + slug, LibraryID: l.ID, StructureVersion: l.StructureVersion, Page: types.WikiPage{Slug: slug, Title: "标题" + slug, PageType: "concept", Content: "不应进入活动的正文"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, r.ResourceID)
+	}
+	pageQueries := 0
+	if err := s.db.Callback().Query().After("gorm:query").Register("activity-title-query-budget", func(db *gorm.DB) {
+		if db.Statement.Table != "wiki_pages" {
+			return
+		}
+		pageQueries++
+		if db.RowsAffected > 5 || len(db.Statement.Selects) != 2 || db.Statement.Selects[0] != "id" || db.Statement.Selects[1] != "title" {
+			t.Errorf("标题预览读取超出有界元数据: rows=%d selects=%v", db.RowsAffected, db.Statement.Selects)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.db.Callback().Query().Remove("activity-title-query-budget") })
+	if err := s.transaction(ctx, func(tx *gorm.DB) error {
+		return appendMutationActivity(ctx, tx, &types.Receipt{RequestID: "preview-many", Operation: "page.agent-write", LibraryID: l.ID, PageIDs: ids}, nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListLibraryActivity(ctx, l.ID, &types.ActivityQuery{Limit: 1})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("活动读取: %v %v", rows, err)
+	}
+	var details map[string]any
+	if err = json.Unmarshal(rows[0].Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if pageQueries != 1 {
+		t.Fatalf("多页活动不应逐页查询: queries=%d", pageQueries)
+	}
+	titles, ok := details["titles"].([]any)
+	if !ok || len(titles) != 5 || details["count"] != float64(8) || titles[0] != "标题a" || titles[4] != "标题e" {
+		t.Fatalf("预览无界或变更数量不实: %s", rows[0].Details)
 	}
 }

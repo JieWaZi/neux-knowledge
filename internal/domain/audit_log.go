@@ -18,6 +18,8 @@ const (
 	AuditActionKnowledgeReparseStarted AuditAction = "knowledge.reparse_started"
 	AuditActionKnowledgeParseCanceled  AuditAction = "knowledge.parse_canceled"
 	AuditActionWikiContentChanged      AuditAction = "wiki.content_changed"
+	// AuditActionWikiMaintenance 记录已有 Wiki 维护任务的接纳与真实结算，不宣称页面已变更。
+	AuditActionWikiMaintenance AuditAction = "wiki.maintenance"
 )
 
 // AuditOutcome separates asynchronous acceptance from terminal business

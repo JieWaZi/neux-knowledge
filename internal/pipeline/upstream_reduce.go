@@ -31,6 +31,12 @@ func (s *upstreamReducer) reduceSlugUpdates(ctx context.Context, kbID, slug stri
 	var page *types.WikiPage
 	page, err = s.GetPageBySlug(ctx, kbID, slug)
 	exists := (err == nil && page != nil)
+	if err != nil {
+		var missing *types.Error
+		if !errors.As(err, &missing) || missing.Code != types.ErrNotFound {
+			return false, "", false, false, err
+		}
+	}
 
 	if !exists {
 		hasAdditions := false
@@ -91,21 +97,12 @@ func (s *upstreamReducer) reduceSlugUpdates(ctx context.Context, kbID, slug stri
 		page.ChunkRefs = types.StringArray{}
 		changed = true
 
+		expected := 0
 		if exists {
-			// A summary rewrite can drop table rows too, and the refusal has
-			// the same meaning here: the page kept its previous body, so this
-			// slug's contribution never landed and its documents must survive
-			// the trim phase. Classify the explicit signal; do not read it off
-			// the page version.
-			_, writeErr := s.UpdatePage(ctx, page)
-			updateDeferred, err = classifyWikiPageWrite(writeErr)
-			if updateDeferred {
-				err = writeErr
-			}
-		} else {
-			_, err = s.CreatePage(ctx, page)
+			expected = page.Version
 		}
-		return changed, affectedType, false, updateDeferred, err
+		_, err = s.publishSourceSummary(ctx, page, summaryUpdate, expected)
+		return err == nil, affectedType, false, false, err
 	}
 
 	var remainingSourcesContent strings.Builder
@@ -438,19 +435,31 @@ func (s *upstreamReducer) filterLiveUpdates(ctx context.Context, _ string, updat
 	s.updates = result
 	return result, nil
 }
-func (s *upstreamReducer) GetPageBySlug(_ context.Context, _ string, slug string) (*types.WikiPage, error) {
+func (s *upstreamReducer) GetPageBySlug(ctx context.Context, kbID string, slug string) (*types.WikiPage, error) {
+	var found *types.WikiPage
 	for _, page := range s.pages {
 		if page.Slug == slug {
-			copy := clonePage(*page)
-			// Upstream source_refs use stable knowledgeID values; local authoritative Evidence retains source versions and maps them to stable SourceID values at the boundary.
-			copy.SourceRefs = nil
-			for _, ref := range copy.Evidence.Sources {
-				copy.SourceRefs = appendUniqueString(copy.SourceRefs, ref.SourceID)
-			}
-			return &copy, nil
+			found = page
+			break
 		}
 	}
-	return nil, &types.Error{Code: types.ErrNotFound, Operation: "lite.page", Detail: "wiki page not found"}
+	if found == nil {
+		// 目录隐藏归档页，但稳定地址仍归原页所有；按地址回读才能沿原身份和读取时间更新。
+		page, err := s.store.GetPageBySlug(ctx, kbID, slug)
+		if err != nil {
+			return nil, err
+		}
+		found = page
+		// 本 reducer 的旧页快照也参与表格保护；不修改并行 reducer 共享的目录切片。
+		s.pages = append(append([]*types.WikiPage(nil), s.pages...), page)
+	}
+	copy := clonePage(*found)
+	// 上游引用使用稳定来源身份；本地证据仍保留实际不可变版本。
+	copy.SourceRefs = nil
+	for _, ref := range copy.Evidence.Sources {
+		copy.SourceRefs = appendUniqueString(copy.SourceRefs, ref.SourceID)
+	}
+	return &copy, nil
 }
 func (s *upstreamReducer) resolveCitedChunks(additions []SlugUpdate) map[string]string {
 	result := map[string]string{}
@@ -482,11 +491,20 @@ func (s *upstreamReducer) UpdatePage(ctx context.Context, page *types.WikiPage) 
 }
 func (s *upstreamReducer) savePage(ctx context.Context, page *types.WikiPage, expected int) (*types.WikiPage, error) {
 	page.WikiLanguage = s.library.WikiLanguage
-	page.Status = "published"
+	// 只撤回归档页的旧贡献时维持归档；收到新贡献才重新发布该稳定身份。
+	publishPage := page.Status != "archived"
+	for _, u := range s.updates {
+		if u.Type == "summary" || u.Type == types.WikiPageTypeConcept || u.Type == types.WikiPageTypeEntity {
+			publishPage = true
+		}
+	}
+	if publishPage {
+		page.Status = "published"
+	}
 	// Retractions delete old-version evidence by stable SourceID; a reparsed new version adds only the actual chunk references from this run.
 	retractIDs := map[string]bool{}
 	for _, u := range s.updates {
-		if u.Type == "retract" || u.Type == "retractStale" {
+		if u.Type == "retract" || u.Type == "retractStale" || u.Type == "summary" {
 			retractIDs[u.KnowledgeID] = true
 		}
 	}

@@ -9,7 +9,7 @@ import (
 )
 
 func TestAuditActionDotNamespaceConvention(t *testing.T) {
-	all := []AuditAction{AuditActionKBCreated, AuditActionKBUpdated, AuditActionKBDeleted, AuditActionKnowledgeCreated, AuditActionKnowledgeUpdated, AuditActionKnowledgeDeleted, AuditActionKnowledgeReparseStarted, AuditActionKnowledgeParseCanceled, AuditActionWikiContentChanged}
+	all := []AuditAction{AuditActionKBCreated, AuditActionKBUpdated, AuditActionKBDeleted, AuditActionKnowledgeCreated, AuditActionKnowledgeUpdated, AuditActionKnowledgeDeleted, AuditActionKnowledgeReparseStarted, AuditActionKnowledgeParseCanceled, AuditActionWikiContentChanged, AuditActionWikiMaintenance}
 	seen := map[AuditAction]bool{}
 	for _, a := range all {
 		s := string(a)

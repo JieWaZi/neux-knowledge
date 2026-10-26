@@ -22,7 +22,8 @@ func TestSQLiteQueriesIncludeAliasesAndAvoidPostgresFunctions(t *testing.T) {
 	hits, err := r.SearchAcross(ctx, []string{"kb"}, "罕见别名", 10)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
-	near, err := r.FindSimilarPages(ctx, "kb", "罕见别名", nil, 10)
+	// 相似候选遵守上游标题排序；别名检索继续由 List 和 SearchAcross 提供。
+	near, err := r.FindSimilarPages(ctx, "kb", p.Title, nil, 10)
 	require.NoError(t, err)
 	require.Len(t, near, 1)
 	_, n, err = r.List(ctx, &types.WikiPageListRequest{KnowledgeBaseID: "kb", Query: "100%"})

@@ -31,24 +31,76 @@ func (s *Store) ListLibraryActivity(ctx context.Context, libraryID string, q *ty
 		if limit > auditLogListLimitMax {
 			limit = auditLogListLimitMax
 		}
-		tx = tx.Where("scope_type = ?", auditScopeKnowledgeBase).Where("scope_id = ?", libraryID)
+		query := tx.Where("scope_type = ?", auditScopeKnowledgeBase).Where("scope_id = ?", libraryID)
 		if q != nil {
 			if q.AfterID > 0 {
-				tx = tx.Where("id < ?", q.AfterID)
+				query = query.Where("id < ?", q.AfterID)
 			}
 			if q.Action != "" {
-				tx = tx.Where("action = ?", q.Action)
+				// 历史维护事件的旧分类只在读取时纠正，筛选仍在分页前按真实任务身份执行。
+				maintenanceIDs := tx.Model(&types.Job{}).Select("id").Where("library_id = ?", libraryID).
+					Where("COALESCE(json_array_length(source_version_ids), 0) = 0 AND json_array_length(json_extract(permission, '$.operations')) = 1 AND json_extract(permission, '$.operations[0]') = ?", "maintain")
+				switch q.Action {
+				case types.AuditActionWikiMaintenance:
+					query = query.Where("action = ? OR (target_type = ? AND target_id IN (?))", q.Action, "knowledge_task", maintenanceIDs)
+				case types.AuditActionWikiContentChanged, types.AuditActionKnowledgeReparseStarted, types.AuditActionKnowledgeParseCanceled:
+					query = query.Where("action = ? AND NOT (target_type = ? AND target_id IN (?))", q.Action, "knowledge_task", maintenanceIDs)
+				default:
+					query = query.Where("action = ?", q.Action)
+				}
 			}
 			if q.Outcome != "" {
-				tx = tx.Where("outcome = ?", q.Outcome)
+				query = query.Where("outcome = ?", q.Outcome)
 			}
 			if q.ActorUserID != "" {
-				tx = tx.Where("actor_user_id = ?", q.ActorUserID)
+				query = query.Where("actor_user_id = ?", q.ActorUserID)
 			}
 		}
-		return tx.Order("id DESC").Limit(limit).Find(&entries).Error
+		if err := query.Order("id DESC").Limit(limit).Find(&entries).Error; err != nil {
+			return err
+		}
+		return projectMaintenanceActivity(tx, libraryID, entries)
 	})
 	return
+}
+
+// projectMaintenanceActivity 只批量补齐当前有界活动页的任务身份，不改写历史或读取页面正文。
+func projectMaintenanceActivity(tx *gorm.DB, libraryID string, entries []*types.AuditLog) error {
+	ids := []string{}
+	for _, entry := range entries {
+		if entry.TargetType == "knowledge_task" {
+			ids = append(ids, entry.TargetID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var jobs []types.Job
+	if err := tx.Select("id", "source_version_ids", "permission").Where("library_id = ? AND id IN ?", libraryID, ids).Find(&jobs).Error; err != nil {
+		return err
+	}
+	maintenance := map[string]bool{}
+	for index := range jobs {
+		if types.IsMaintenanceJob(&jobs[index]) {
+			maintenance[jobs[index].ID] = true
+		}
+	}
+	for _, entry := range entries {
+		if entry.TargetType != "knowledge_task" || !maintenance[entry.TargetID] {
+			continue
+		}
+		entry.Action, entry.TargetType = types.AuditActionWikiMaintenance, "wiki_maintenance_task"
+		metadata := map[string]any{}
+		if err := json.Unmarshal(entry.Details, &metadata); err != nil {
+			metadata = map[string]any{}
+		}
+		delete(metadata, "total")
+		delete(metadata, "count")
+		metadata["scope"] = "existing_wiki"
+		// 旧事件没有可靠的页面变更计数，保持未知，不能从空来源或当前页数推断。
+		entry.Details, _ = json.Marshal(metadata)
+	}
+	return nil
 }
 
 // kbActivityAppendSampleTitles preserves deduplication, trimming, and first-title mirroring rules.
@@ -93,7 +145,7 @@ func sanitizeActivityDetails(details map[string]any) types.JSON {
 	safe := map[string]any{}
 	for key, value := range details {
 		switch key {
-		case "title", "task_id", "trigger", "processing_status", "via":
+		case "title", "task_id", "trigger", "processing_status", "via", "scope":
 			if text, ok := value.(string); ok {
 				runes := []rune(text)
 				if len(runes) > 200 {
@@ -101,7 +153,7 @@ func sanitizeActivityDetails(details map[string]any) types.JSON {
 				}
 				safe[key] = string(runes)
 			}
-		case "count", "total", "failed", "skipped", "attempt":
+		case "count", "total", "failed", "skipped", "attempt", "changed_pages":
 			if n, ok := value.(int); ok && n >= 0 {
 				safe[key] = n
 			}
@@ -165,6 +217,31 @@ func recordKBActivity(tx *gorm.DB, requestID, operation, libraryID string, actor
 	return tx.Create(&types.AuditLog{RequestID: requestID, Operation: operation, ActorUserID: actor.UserID, ActorRole: actor.Role, Action: action, ScopeType: auditScopeKnowledgeBase, ScopeID: libraryID, TargetType: targetType, TargetID: targetID, Outcome: outcome, Details: sanitizeActivityDetails(copied), CreatedAt: time.Now()}).Error
 }
 
+// appendActivityPageTitles 在原事务中只读取回执前五个页面的名称，包含本次软删除对象，不读取正文。
+func appendActivityPageTitles(tx *gorm.DB, libraryID string, pageIDs []string, details map[string]any) error {
+	if len(pageIDs) == 0 {
+		return nil
+	}
+	preview := pageIDs
+	if len(preview) > kbActivitySampleTitleLimit {
+		preview = preview[:kbActivitySampleTitleLimit]
+	}
+	var pages []types.WikiPage
+	if err := tx.Unscoped().Select("id", "title").Where("knowledge_base_id = ? AND id IN ?", libraryID, preview).Find(&pages).Error; err != nil {
+		return err
+	}
+	titles := make(map[string]string, len(pages))
+	for _, page := range pages {
+		titles[page.ID] = page.Title
+	}
+	samples := make([]string, 0, len(preview))
+	for _, id := range preview {
+		samples = append(samples, titles[id])
+	}
+	kbActivityAppendSampleTitles(details, samples...)
+	return nil
+}
+
 // appendMutationActivity records only domain changes actually committed by the current transaction.
 // It runs in mutate's new-request branch, so receipt replay cannot execute it again; it does not read bodies or raw configuration.
 func appendMutationActivity(ctx context.Context, tx *gorm.DB, r *types.Receipt, input any) error {
@@ -182,21 +259,31 @@ func appendMutationActivity(ctx context.Context, tx *gorm.DB, r *types.Receipt, 
 	case "library.update":
 		// UpdateLibrary holds old values in the same transaction and records actual field differences; do not record them again here.
 		return nil
-	case "page.agent-write", "page.replace-text", "page.rename", "page.delete":
+	case "page.agent-write", "page.replace-text", "page.rename", "page.delete", "wiki.auto-fix":
 		// Maintenance actions share a transaction with bodies, cascading page changes, and receipts; replaying the original request does not duplicate activity.
 		action = types.AuditActionWikiContentChanged
 		targetType, targetID = "wiki", r.LibraryID
 		details["count"] = len(r.PageIDs)
+		if err := appendActivityPageTitles(tx, r.LibraryID, r.PageIDs, details); err != nil {
+			return err
+		}
 	case "source.import":
 		action = types.AuditActionKnowledgeCreated
 		targetType = "knowledge"
-		if in, ok := input.(types.ImportSourceInput); ok {
+		in, ok := input.(types.ImportSourceInput)
+		if mutation, isImport := input.(sourceImportMutation); isImport {
+			if mutation.reused != nil && *mutation.reused {
+				return nil
+			}
+			in, ok = mutation.ImportSourceInput, true
+		}
+		if ok {
 			kbActivityAppendSampleTitles(details, in.Filename)
 			if in.SourceID != "" {
 				action = types.AuditActionKnowledgeUpdated
 			}
 		}
-	case "job.accept", "job.retry", "job.fail", "job.cancel", "stage.outcome", "publication.publish":
+	case "job.accept", "job.retry", "job.fail", "job.cancel", "stage.outcome", "publication.publish", "lite.publish", "wiki.maintenance.complete":
 		if r.JobID == "" || r.State == "no-op" {
 			return nil
 		}
@@ -238,9 +325,12 @@ func appendMutationActivity(ctx context.Context, tx *gorm.DB, r *types.Receipt, 
 			}
 			action = types.AuditActionKnowledgeParseCanceled
 			outcome = types.AuditOutcomeCanceled
-		case "publication.publish":
+		case "publication.publish", "lite.publish", "wiki.maintenance.complete":
 			if len(r.PageIDs) > 0 {
 				wikiDetails := map[string]any{"count": len(r.PageIDs), "task_id": j.ID, "attempt": j.Attempt}
+				if err := appendActivityPageTitles(tx, r.LibraryID, r.PageIDs, wikiDetails); err != nil {
+					return err
+				}
 				if err := recordKBActivity(tx, r.RequestID, r.Operation, r.LibraryID, actor, types.AuditActionWikiContentChanged, "wiki", r.LibraryID, types.AuditOutcomeSuccess, wikiDetails); err != nil {
 					return err
 				}
@@ -259,6 +349,25 @@ func appendMutationActivity(ctx context.Context, tx *gorm.DB, r *types.Receipt, 
 				outcome = types.AuditOutcomeFailed
 			default:
 				return nil
+			}
+		}
+		if types.IsMaintenanceJob(j) {
+			action, targetType = types.AuditActionWikiMaintenance, "wiki_maintenance_task"
+			delete(details, "total")
+			details["scope"] = "existing_wiki"
+			if outcome != types.AuditOutcomeAccepted {
+				// 只读取本次尝试的真实写回执，重复修改同一页面只计一页。
+				var receipts []types.Receipt
+				if err := tx.Select("page_ids").Where("library_id = ? AND job_id = ? AND job_attempt = ?", j.LibraryID, j.ID, j.Attempt).Find(&receipts).Error; err != nil {
+					return err
+				}
+				changed := map[string]bool{}
+				for _, receipt := range receipts {
+					for _, id := range receipt.PageIDs {
+						changed[id] = true
+					}
+				}
+				details["changed_pages"] = len(changed)
 			}
 		}
 	default:

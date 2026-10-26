@@ -30,6 +30,7 @@ const (
 	AuditActionKnowledgeReparseStarted = types.AuditActionKnowledgeReparseStarted
 	AuditActionKnowledgeParseCanceled  = types.AuditActionKnowledgeParseCanceled
 	AuditActionWikiContentChanged      = types.AuditActionWikiContentChanged
+	AuditActionWikiMaintenance         = types.AuditActionWikiMaintenance
 	AuditOutcomeSuccess                = types.AuditOutcomeSuccess
 	AuditOutcomeAccepted               = types.AuditOutcomeAccepted
 	AuditOutcomeDenied                 = types.AuditOutcomeDenied

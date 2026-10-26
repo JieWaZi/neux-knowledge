@@ -50,7 +50,7 @@ func contractFixture(t *testing.T, count int, raw ...[]byte) (*store.Store, *typ
 	for i := 0; i < count; i++ {
 		body := []byte(fmt.Sprintf("# 会话管理%d\n服务端校验在线会话，离线会话遵循单独有效条件。", i))
 		if len(raw) > 0 {
-			body = raw[0]
+			body = raw[min(i, len(raw)-1)]
 		}
 		rec, err = s.ImportSource(ctx, types.ImportSourceInput{RequestID: fmt.Sprintf("source%d", i), LibraryID: l.ID, Filename: fmt.Sprintf("文档%d.md", i), MIME: "text/markdown", Bytes: body})
 		if err != nil {
@@ -267,6 +267,9 @@ func TestLiteReparseReplacesStableSourceContribution(t *testing.T) {
 	}
 	if len(summaries) != 1 || summaries[0].Slug != "summary/"+slugify(original[0].SourceID) || !strings.Contains(summaries[0].Content, "新规则说明") {
 		t.Fatalf("stable source summary was not overwritten: %+v", summaries)
+	}
+	if len(summaries[0].Evidence.Sources) != 1 || summaries[0].Evidence.Sources[0].SourceVersionID != current.ID {
+		t.Fatalf("summary retained old source version: %+v", summaries[0].Evidence)
 	}
 	sawSwap, sawStale := false, false
 	for _, r := range second.calls {

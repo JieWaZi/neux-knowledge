@@ -1,6 +1,28 @@
 package core
 
-import "context"
+import (
+	"context"
+
+	types "github.com/JieWaZi/neux-knowledge/internal/domain"
+)
+
+// IsMaintenanceJob 判断任务是否维护已有 Wiki，而非重新处理原件。
+func IsMaintenanceJob(job *Job) bool { return types.IsMaintenanceJob(job) }
+
+// WithMaintenanceJob 将本次 ACP 工具写入约束到原维护任务与尝试。
+func WithMaintenanceJob(ctx context.Context, jobID string, attempt int) context.Context {
+	return types.WithMaintenanceJob(ctx, jobID, attempt)
+}
+
+// ActivateQueuedJob 只启动当前库的队首任务，维护与原件整理共用顺序。
+func (e *Engine) ActivateQueuedJob(ctx context.Context, jobID string) (*Job, bool, error) {
+	return e.store.ActivateQueuedJob(ctx, jobID)
+}
+
+// CompleteMaintenanceJob 保存独立 ACP 的真实报告并结算维护任务，不修改来源状态。
+func (e *Engine) CompleteMaintenanceJob(ctx context.Context, in JobActionInput, report string) (*Receipt, error) {
+	return e.store.CompleteMaintenanceJob(ctx, in, report)
+}
 
 // AcceptJob performs the corresponding knowledge domain operation under the SDK contract.
 func (e *Engine) AcceptJob(ctx context.Context, in AcceptJobInput) (*Receipt, error) {

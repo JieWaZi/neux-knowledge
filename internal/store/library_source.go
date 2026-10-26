@@ -192,8 +192,17 @@ func (s *Store) saveRaw(bytes []byte, temp string) (string, error) {
 	return key, nil
 }
 
+// sourceImportMutation 仅向同事务活动记录传递是否创建来源；序列化仍与原输入一致，不增加持久业务事实。
+type sourceImportMutation struct {
+	types.ImportSourceInput       // 原始导入参数，保持既有请求摘要。
+	reused                  *bool // 本事务是否复用来源；不进入序列化或持久化。
+}
+
 // ImportSource saves immutable original bytes; importing source files does not create an organization task.
 func (s *Store) ImportSource(ctx context.Context, in types.ImportSourceInput) (*types.Receipt, error) {
+	if _, scoped := types.MaintenanceJobFromContext(ctx); scoped {
+		return nil, fail(types.ErrScopeViolation, "source.import", "Wiki maintenance cannot import originals")
+	}
 	if !validFilename(in.Filename) {
 		return nil, fail(types.ErrInvalid, "source.import", "filename must not contain a path")
 	}
@@ -217,7 +226,9 @@ func (s *Store) ImportSource(ctx context.Context, in types.ImportSourceInput) (*
 	if err != nil {
 		return nil, err
 	}
-	return s.mutate(ctx, in.RequestID, "source.import", in.LibraryID, in, func(tx *gorm.DB) (*types.Receipt, error) {
+	reused := false
+	return s.mutate(ctx, in.RequestID, "source.import", in.LibraryID, sourceImportMutation{ImportSourceInput: in, reused: &reused}, func(tx *gorm.DB) (*types.Receipt, error) {
+		reused = false
 		library, err := getLibrary(tx, in.LibraryID, true)
 		if err != nil {
 			return nil, err
@@ -231,6 +242,24 @@ func (s *Store) ImportSource(ctx context.Context, in types.ImportSourceInput) (*
 		if sourceID == "" {
 			if in.ExpectedVersion != 0 {
 				return nil, fail(types.ErrVersionConflict, "source.import", "new source requires version zero")
+			}
+			// 迁移 WeKnora CheckKnowledgeExists 的同库文件哈希和文件类型判重；只复用当前有效来源。
+			query := tx.Where("library_id = ? AND sha256 = ? AND archived = ? AND state NOT IN ?", in.LibraryID, key, false, []string{"failed", "deleting"}).
+				Where("id IN (SELECT version_id FROM knowledge_sources WHERE library_id = ?)", in.LibraryID)
+			if extension := strings.ToLower(filepath.Ext(in.Filename)); extension != "" {
+				query = query.Where("lower(filename) LIKE ? ESCAPE '\\'", "%"+escapeLikePattern(extension))
+			}
+			var existing types.SourceVersion
+			duplicateErr := query.Order("created_at ASC, id ASC").Take(&existing).Error
+			if duplicateErr == nil {
+				if err := tx.Where("request_id = ?", in.RequestID).Delete(&types.ImportBlobIntent{}).Error; err != nil {
+					return nil, err
+				}
+				reused = true
+				return &types.Receipt{ResourceID: existing.ID, Version: existing.Version, State: "saved"}, nil
+			}
+			if !errors.Is(duplicateErr, gorm.ErrRecordNotFound) {
+				return nil, duplicateErr
 			}
 			sourceID = intent.SourceID
 		} else {

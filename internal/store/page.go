@@ -439,10 +439,11 @@ func (s *Store) GetRevision(ctx context.Context, lib, pageID string, version int
 	return
 }
 
-func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated bool, edit pageEdit) (string, error) {
+func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated bool, edit pageEdit) (string, []string, error) {
+	pageIDs := []string{}
 	t := in.Theme
 	if t.KnowledgeBaseID != "" && t.KnowledgeBaseID != l.ID {
-		return "", fail(types.ErrScopeViolation, "theme.write", "theme belongs to another library")
+		return "", nil, fail(types.ErrScopeViolation, "theme.write", "theme belongs to another library")
 	}
 	t.KnowledgeBaseID = l.ID
 	t.TenantID = 0
@@ -452,56 +453,56 @@ func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated
 		old, err = getTheme(tx, l.ID, t.ID)
 		// Parent and child topics and pages refer to fixed identities during publication; creation must preserve these references.
 		if err != nil && !(generated && !in.Delete && errors.Is(err, gorm.ErrRecordNotFound)) {
-			return "", err
+			return "", nil, err
 		}
 		if generated && old != nil && old.Manual && (in.Delete || t.Name != old.Name || t.ParentID != old.ParentID || t.SortOrder != old.SortOrder) {
-			return "", fail(types.ErrManualProtected, "theme.write", "manual theme is protected")
+			return "", nil, fail(types.ErrManualProtected, "theme.write", "manual theme is protected")
 		}
 		if generated && old != nil {
 			t.Manual = old.Manual
 		}
 	}
 	if old != nil && old.SystemKey != "" {
-		return "", fail(types.ErrManualProtected, "theme.write", "system theme is protected")
+		return "", nil, fail(types.ErrManualProtected, "theme.write", "system theme is protected")
 	}
 	if old == nil && t.SystemKey != "" {
-		return "", fail(types.ErrInvalid, "theme.write", "systemKey is reserved")
+		return "", nil, fail(types.ErrInvalid, "theme.write", "systemKey is reserved")
 	}
 	if in.Delete {
 		if old == nil {
-			return "", fail(types.ErrNotFound, "theme.delete", "theme is missing")
+			return "", nil, fail(types.ErrNotFound, "theme.delete", "theme is missing")
 		}
 		var n int64
 		if err := tx.Model(&types.WikiFolder{}).Where("knowledge_base_id = ? AND parent_id = ?", l.ID, t.ID).Count(&n).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if n > 0 {
-			return "", fail(types.ErrInvalid, "theme.delete", "theme has children")
+			return "", nil, fail(types.ErrInvalid, "theme.delete", "theme has children")
 		}
 		if err := tx.Model(&types.WikiPage{}).Where("knowledge_base_id = ? AND folder_id = ?", l.ID, t.ID).Count(&n).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if n > 0 {
-			return "", fail(types.ErrInvalid, "theme.delete", "theme contains pages")
+			return "", nil, fail(types.ErrInvalid, "theme.delete", "theme contains pages")
 		}
-		return t.ID, tx.Where("id = ? AND knowledge_base_id = ?", t.ID, l.ID).Delete(&types.WikiFolder{}).Error
+		return t.ID, nil, tx.Where("id = ? AND knowledge_base_id = ?", t.ID, l.ID).Delete(&types.WikiFolder{}).Error
 	}
 	t.Name = strings.TrimSpace(t.Name)
 	if t.Name == "" || strings.ContainsAny(t.Name, "/\\") {
-		return "", fail(types.ErrInvalid, "theme.write", "theme name must be a segment")
+		return "", nil, fail(types.ErrInvalid, "theme.write", "theme name must be a segment")
 	}
 	t.Depth = 1
 	t.Path = t.Name
 	if t.ParentID != "" {
 		if t.ParentID == t.ID {
-			return "", fail(types.ErrInvalid, "theme.write", "theme cannot parent itself")
+			return "", nil, fail(types.ErrInvalid, "theme.write", "theme cannot parent itself")
 		}
 		parent, err := getTheme(tx, l.ID, t.ParentID)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if parent.Depth >= 2 {
-			return "", fail(types.ErrInvalid, "theme.write", "only two theme levels are allowed")
+			return "", nil, fail(types.ErrInvalid, "theme.write", "only two theme levels are allowed")
 		}
 		t.Depth = parent.Depth + 1
 		t.Path = parent.Path + "/" + t.Name
@@ -513,10 +514,10 @@ func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated
 	// Sibling names must be unique; no additional derived name field is used for duplicate checks.
 	var duplicate int64
 	if err := tx.Model(&types.WikiFolder{}).Where("knowledge_base_id = ? AND parent_id = ? AND name = ? AND id <> ?", l.ID, t.ParentID, t.Name, t.ID).Count(&duplicate).Error; err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if duplicate > 0 {
-		return "", fail(types.ErrVersionConflict, "theme.write", "sibling theme name exists")
+		return "", nil, fail(types.ErrVersionConflict, "theme.write", "sibling theme name exists")
 	}
 	if old == nil {
 		if t.ID == "" {
@@ -524,22 +525,22 @@ func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated
 		}
 		t.CreatedAt = t.UpdatedAt
 		if err := tx.Create(&t).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 	} else {
 		var children []*types.WikiFolder
 		if err := tx.Where("knowledge_base_id = ? AND parent_id = ?", l.ID, t.ID).Find(&children).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if len(children) > 0 && t.Depth != 1 {
-			return "", fail(types.ErrInvalid, "theme.write", "moving a parent would exceed two levels")
+			return "", nil, fail(types.ErrInvalid, "theme.write", "moving a parent would exceed two levels")
 		}
 		if err := tx.Model(&types.WikiFolder{}).Where("id = ? AND knowledge_base_id = ?", t.ID, l.ID).Updates(map[string]any{"name": t.Name, "parent_id": t.ParentID, "path": t.Path, "depth": t.Depth, "sort_order": t.SortOrder, "manual": t.Manual, "updated_at": t.UpdatedAt}).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 		for _, child := range children {
 			if err := tx.Model(&types.WikiFolder{}).Where("id = ? AND knowledge_base_id = ?", child.ID, l.ID).Updates(map[string]any{"path": t.Path + "/" + child.Name, "depth": 2, "updated_at": t.UpdatedAt}).Error; err != nil {
-				return "", err
+				return "", nil, err
 			}
 		}
 		ids := []string{t.ID}
@@ -548,18 +549,20 @@ func applyTheme(tx *gorm.DB, l *types.Library, in types.ThemeMutation, generated
 		}
 		var pages []*types.WikiPage
 		if err := tx.Where("knowledge_base_id = ? AND folder_id IN ?", l.ID, ids).Find(&pages).Error; err != nil {
-			return "", err
+			return "", nil, err
 		}
 		for _, p := range pages {
 			if generated && p.ManualPlacement && old.Path != t.Path {
-				return "", fail(types.ErrManualProtected, "theme.write", "manual page path is protected")
+				return "", nil, fail(types.ErrManualProtected, "theme.write", "manual page path is protected")
 			}
 			if _, err := writePageWithEdit(tx, l, p, p.Version, generated, nil, edit); err != nil {
-				return "", err
+				return "", nil, err
 			}
+			// 只收集本事务已实际写入的级联页面，供原操作回执审计，不从目录页数推断。
+			pageIDs = append(pageIDs, p.ID)
 		}
 	}
-	return t.ID, nil
+	return t.ID, pageIDs, nil
 }
 
 // WriteTheme creates, moves, or deletes manual topics up to two levels deep.
@@ -575,14 +578,14 @@ func (s *Store) WriteTheme(ctx context.Context, in types.WriteThemeInput) (*type
 		if l.StructureVersion != in.StructureVersion {
 			return nil, fail(types.ErrVersionConflict, "theme.write", "structure changed")
 		}
-		id, err := applyTheme(tx, l, types.ThemeMutation{Theme: in.Theme, Delete: in.Delete}, false, pageEdit{})
+		id, pageIDs, err := applyTheme(tx, l, types.ThemeMutation{Theme: in.Theme, Delete: in.Delete}, false, pageEdit{})
 		if err != nil {
 			return nil, err
 		}
 		if err = bumpStructure(tx, l); err != nil {
 			return nil, err
 		}
-		return &types.Receipt{ResourceID: id, Version: l.StructureVersion, State: "saved"}, nil
+		return &types.Receipt{ResourceID: id, Version: l.StructureVersion, PageIDs: pageIDs, State: "saved"}, nil
 	})
 }
 

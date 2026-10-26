@@ -6,7 +6,7 @@ import (
 )
 
 // StagePromptVersion fixes the organization-stage prompt source used in the task configDigest.
-const StagePromptVersion = "weknora-8776a2d-lite-direct-v2"
+const StagePromptVersion = "weknora-8776a2d-lite-direct-v3"
 
 // StagePrompt holds fixed upstream system and user messages for the direct model port.
 type StagePrompt struct {

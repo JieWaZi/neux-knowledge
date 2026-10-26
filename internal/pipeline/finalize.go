@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 	"github.com/JieWaZi/neux-knowledge/internal/wiki"
@@ -76,6 +77,43 @@ func (s *liteService) rebuildIndex(ctx context.Context, ops []*types.WikiFinaliz
 		return err
 	}
 	index, expected := newPage(s.job.LibraryID, "index", "index", pages)
+	if expected == 0 {
+		// 目录隐藏归档页，索引的稳定地址仍须沿原身份和读取时间更新。
+		stored, readErr := s.store.GetPageBySlug(ctx, s.job.LibraryID, "index")
+		if readErr == nil {
+			index, expected = clonePage(*stored), stored.Version
+		} else {
+			var missing *types.Error
+			if !errors.As(readErr, &missing) || missing.Code != types.ErrNotFound {
+				return readErr
+			}
+		}
+	}
+	// 阶段身份只依赖同任务的语义增量集合，不随恢复时的尝试和数据库行身份变化。
+	rawOps := ops
+	byKey := map[string]*types.WikiFinalizeOp{}
+	for _, op := range ops {
+		if byKey[op.Key] == nil || op.Kind == "slug" {
+			byKey[op.Key] = op
+		}
+	}
+	ops = nil
+	canonical := []types.WikiFinalizeOp{}
+	for _, key := range sortedKeys(byKey) {
+		op := byKey[key]
+		ops = append(ops, op)
+		copy := *op
+		copy.ID = ""
+		copy.JobAttempt = 0
+		copy.CreatedAt = 0
+		canonical = append(canonical, copy)
+	}
+	checkpointKey := "lite/" + s.job.ID + "/finalize-index/" + hash(marshal(canonical))
+	applied, err := s.store.HasCurrentLitePageCheckpoint(ctx, s.job.ID, s.job.Attempt, checkpointKey, &index)
+	if err != nil || applied {
+		return err
+	}
+	index.Status = "published"
 	index.Title = "Wiki Index"
 	index.WikiLanguage = s.library.WikiLanguage
 	existingIntro := strings.TrimSpace(index.Content)
@@ -86,7 +124,43 @@ func (s *liteService) rebuildIndex(ctx context.Context, ops []*types.WikiFinaliz
 		existingIntro = strings.TrimSpace(existingIntro[:at])
 	}
 	var change strings.Builder
+	indexKeys := []string{checkpointKey}
+	legacyConsumed := map[string]bool{}
+	legacyChecked := map[int]bool{}
+	groups := map[int][]*types.WikiFinalizeOp{}
+	for _, op := range rawOps {
+		groups[op.JobAttempt] = append(groups[op.JobAttempt], op)
+	}
 	for _, op := range ops {
+		if op.Kind != "added" && op.Kind != "removed" {
+			continue
+		}
+		contributionHash := hash(marshal([]string{"finalize-index-op", op.Key}))
+		consumed, e := s.store.HasLiteContribution(ctx, s.job.ID, contributionHash)
+		if e != nil {
+			return e
+		}
+		if consumed {
+			continue
+		}
+		// 旧版阶段回执按尝试和原始增量集合命名；核验真实索引后迁入逐项回执，不再把旧增量交给模型。
+		if !legacyChecked[op.JobAttempt] {
+			legacyChecked[op.JobAttempt] = true
+			legacyKey := fmt.Sprintf("lite/%s/%d/finalize-index/%s", s.job.ID, op.JobAttempt, hash(marshal(groups[op.JobAttempt])))
+			applied, e := s.store.HasCurrentLitePageCheckpoint(ctx, s.job.ID, s.job.Attempt, legacyKey, &index)
+			if e != nil {
+				return e
+			}
+			if applied {
+				for _, prior := range groups[op.JobAttempt] {
+					legacyConsumed[prior.Key] = true
+				}
+			}
+		}
+		indexKeys = append(indexKeys, "lite/"+s.job.ID+"/applied/"+contributionHash)
+		if legacyConsumed[op.Key] {
+			continue
+		}
 		if op.Kind == "added" {
 			fmt.Fprintf(&change, "<document_added>\n<title>%s</title>\n<summary>%s</summary>\n</document_added>\n\n", op.DocTitle, op.DocSummary)
 		} else if op.Kind == "removed" {
@@ -147,7 +221,9 @@ func (s *liteService) rebuildIndex(ctx context.Context, ops []*types.WikiFinaliz
 	}
 	index.Content = wiki.NormalizeIndexIntro(index.Content)
 	index.Summary = index.Content
-	_, err = s.publish(ctx, "index/"+hash([]byte(index.Content)), &types.Publication{Maintenance: true, Pages: []types.PageMutation{{Page: index, ExpectedVersion: expected}}})
+	mutation := types.PageMutation{Page: index, ExpectedVersion: expected}
+	// 恢复可能读到同正文的新版本或读取时间；幂等身份必须覆盖完整提交内容。
+	_, err = s.publish(ctx, "index/"+hash(marshal(mutation)), &types.Publication{Maintenance: true, Pages: []types.PageMutation{mutation}}, indexKeys...)
 	return err
 }
 func (s *liteService) finalizeLinks(ctx context.Context, ops []*types.WikiFinalizeOp) error {

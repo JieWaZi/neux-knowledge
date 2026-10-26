@@ -12,6 +12,11 @@ func (s *liteService) claimWikiIdentitySlug(
 	authoritative bool,
 	batchCtx *WikiBatchContext,
 ) string {
+	// 摘要与索引地址归系统所有；模型知识候选按可信类型和标题重新取得普通地址。
+	reserved := strings.TrimSpace(proposedSlug)
+	if (pageType == types.WikiPageTypeEntity || pageType == types.WikiPageTypeConcept) && (strings.HasPrefix(reserved, "summary/") || reserved == "index" || strings.HasPrefix(reserved, "index/")) {
+		proposedSlug = pageType + "/" + slugify(title)
+	}
 	identity := normalizeWikiIdentityTitle(title)
 	expectedPrefix := pageType + "/"
 	if identity == "" || proposedSlug == "" || !strings.HasPrefix(proposedSlug, expectedPrefix) {

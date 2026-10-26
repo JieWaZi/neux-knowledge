@@ -165,7 +165,7 @@ func (s *Store) RenamePage(ctx context.Context, in types.RenamePageInput) (*type
 		if _, err = writePageWithEdit(tx, l, p, in.ExpectedVersion, true, nil, pageEdit{agent: true, rename: true, rewrite: rewrite}); err != nil {
 			return nil, err
 		}
-		ids, err := rewriteIncomingPages(tx, l, p.ID, oldSlug, in.NewSlug, rewrite)
+		ids, err := rewriteIncomingPages(tx, l, p.ID, oldSlug, in.NewSlug, rewrite, false)
 		if err != nil {
 			return nil, err
 		}
@@ -199,7 +199,7 @@ func (s *Store) DeletePage(ctx context.Context, in types.DeletePageInput) (*type
 		rewrite := func(content string) string {
 			return wiki.RewritePageLinks(content, p.Slug, "")
 		}
-		ids, err := rewriteIncomingPages(tx, l, p.ID, p.Slug, "", rewrite)
+		ids, err := rewriteIncomingPages(tx, l, p.ID, p.Slug, "", rewrite, false)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +217,7 @@ func (s *Store) DeletePage(ctx context.Context, in types.DeletePageInput) (*type
 	})
 }
 
-func rewriteIncomingPages(tx *gorm.DB, l *types.Library, exclude, oldSlug, newSlug string, rewrite func(string) string) ([]string, error) {
+func rewriteIncomingPages(tx *gorm.DB, l *types.Library, exclude, oldSlug, newSlug string, rewrite func(string) string, preserveProtected bool) ([]string, error) {
 	var pages []*types.WikiPage
 	// Use a single-table candidate query within the library; exact Markdown matching still uses the rewrite rules so wildcards cannot expand scope.
 	if err := tx.Where("knowledge_base_id = ? AND id <> ? AND (CAST(out_links AS TEXT) LIKE ? ESCAPE '\\' OR parent_slug = ?)", l.ID, exclude, "%"+escapeLikePattern(oldSlug)+"%", oldSlug).Order("id ASC").Find(&pages).Error; err != nil {
@@ -225,6 +225,10 @@ func rewriteIncomingPages(tx *gorm.DB, l *types.Library, exclude, oldSlug, newSl
 	}
 	ids := []string{}
 	for _, p := range pages {
+		// 确定性自动修复不改写人工保护内容或索引；显式改名和归档仍沿原精确变换处理。
+		if preserveProtected && (p.PageType == types.WikiPageTypeIndex || p.LastEditSource == types.WikiEditSourceUser || len(p.ProtectedContent) > 0) {
+			continue
+		}
 		updated := p.Content
 		if slices.Contains(p.OutLinks, oldSlug) {
 			updated = rewrite(p.Content)

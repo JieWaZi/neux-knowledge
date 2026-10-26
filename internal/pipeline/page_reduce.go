@@ -49,11 +49,12 @@ func (s *liteService) planTaxonomy(ctx context.Context, updates map[string][]Slu
 			}
 		}
 		sort.Strings(ids)
-		raw, err := s.generate(ctx, "taxonomy", "", ids, wiki.WikiTaxonomyPlanPrompt, map[string]string{"ExistingTaxonomy": tree, "Items": block.String(), "Language": language(s.library.WikiLanguage)})
+		var planned taxonomyAssignments
+		err := s.generateJSON(ctx, "taxonomy", "", ids, wiki.WikiTaxonomyPlanPrompt, map[string]string{"ExistingTaxonomy": tree, "Items": block.String(), "Language": language(s.library.WikiLanguage)}, &planned)
 		if err != nil {
 			continue
 		}
-		for slug, path := range parseTaxonomyAssignments(raw) {
+		for slug, path := range planned.paths() {
 			if !allowed[slug] {
 				continue
 			}

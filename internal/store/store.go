@@ -321,6 +321,9 @@ func (s *Store) mutate(ctx context.Context, requestID, op, libraryID string, inp
 	}{op, input})
 	var result *types.Receipt
 	err := s.transaction(ctx, func(tx *gorm.DB) error {
+		if err := checkMaintenanceWrite(ctx, tx, op, libraryID); err != nil {
+			return err
+		}
 		var prior types.Receipt
 		err := tx.Where("request_id = ?", requestID).Take(&prior).Error
 		if err == nil {
@@ -339,6 +342,9 @@ func (s *Store) mutate(ctx context.Context, requestID, op, libraryID string, inp
 		}
 		result.RequestID = requestID
 		result.Operation = op
+		if scope, scoped := types.MaintenanceJobFromContext(ctx); scoped {
+			result.JobID, result.JobAttempt = scope.JobID, scope.Attempt
+		}
 		if libraryID != "" {
 			result.LibraryID = libraryID
 		}

@@ -70,7 +70,7 @@ func formatExistingTaxonomyForPrompt(paths [][]string) string {
 }
 
 func cleanLLMJSON(s string) string {
-	s = strings.TrimSpace(s)
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "\uFEFF"))
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")

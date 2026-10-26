@@ -1,5 +1,20 @@
 package types
 
+// AutoFixInput 固定上游确定性修复的知识库、目录与权限版本。
+type AutoFixInput struct {
+	RequestID             string `json:"requestId"`             // 本次修复的稳定请求身份。
+	LibraryID             string `json:"libraryId"`             // 用户授权修复的知识库。
+	StructureVersion      int64  `json:"structureVersion"`      // 已读取的目录版本。
+	ExpectedPolicyVersion int64  `json:"expectedPolicyVersion"` // 冻结的库权限版本。
+}
+
+// AutoFixResult 返回已提交修复及当前仍需维护的问题。
+type AutoFixResult struct {
+	Receipt *Receipt    `json:"receipt"` // 与修复同事务提交的持久回执。
+	Fixed   int         `json:"fixed"`   // 此请求实际修改的页面数量。
+	Report  *LintReport `json:"report"`  // 修复后当前版本的只读核查结果。
+}
+
 // LintIssue is a read-only review finding and grants no implicit repair authority.
 type LintIssue struct {
 	Type        string `json:"type"`               // orphan_page, broken_link, empty_content, or stale_ref.

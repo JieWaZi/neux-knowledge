@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 	"github.com/JieWaZi/neux-knowledge/internal/wiki"
@@ -58,7 +57,8 @@ func (s *liteService) mapOneDocument(ctx context.Context, source *types.SourceVe
 		return nil, nil, nil
 	}
 	var err error
-	content := reconstructContent(chunks)
+	fullContent := reconstructContent(chunks)
+	content := fullContent
 	if len([]rune(content)) > maxContentForWiki {
 		content = string([]rune(content)[:maxContentForWiki])
 	}
@@ -143,7 +143,7 @@ func (s *liteService) mapOneDocument(ctx context.Context, source *types.SourceVe
 	go func() {
 		defer wg.Done()
 		summaryContent, summaryErr = s.generate(ctx, "summary", source.ID, []string{source.ID}, wiki.WikiSummaryPrompt, map[string]string{
-			"Content":            content,
+			"Content":            wikiSummarySourceInput(fullContent),
 			"Language":           lang,
 			"ExtractedSlugs":     slugListing,
 			"CustomInstructions": batchCtx.ContentInstructions,
@@ -449,14 +449,10 @@ func (s *liteService) extractUpstream(ctx context.Context, source *types.SourceV
 	if legacy {
 		prompt = wiki.WikiKnowledgeExtractPrompt
 	}
-	raw, err := s.generate(ctx, "map", source.ID, []string{source.ID}, prompt, map[string]string{"Content": content, "Language": lang, "PreviousSlugs": prevSlugsText, "Granularity": string(granularity), "GranularityGuidance": wiki.WikiGranularityGuidance(string(granularity)), "CustomInstructions": batchCtx.ExtractionInstructions, "InstructionScope": "wiki_extraction"})
+	var result combinedExtraction
+	err := s.generateJSON(ctx, "map", source.ID, []string{source.ID}, prompt, map[string]string{"Content": content, "Language": lang, "PreviousSlugs": prevSlugsText, "Granularity": string(granularity), "GranularityGuidance": wiki.WikiGranularityGuidance(string(granularity)), "CustomInstructions": batchCtx.ExtractionInstructions, "InstructionScope": "wiki_extraction"}, &result)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	var result combinedExtraction
-	if err = json.Unmarshal([]byte(cleanLLMJSON(raw)), &result); err != nil {
-		s.markParseError(ctx, "map", source.ID, raw, err)
-		return nil, nil, nil, invalid("parse candidate slug JSON: " + err.Error())
 	}
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(ctx, source.ID, result.Entities, result.Concepts, batchCtx)
 	slugItems := map[string]extractedItem{}

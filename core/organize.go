@@ -28,6 +28,13 @@ type (
 
 // RunOrganize executes the fixed Lite pipeline; model calls do not create chats or generic executions.
 func (e *Engine) RunOrganize(ctx context.Context, in OrganizeInput) (*OrganizeResult, error) {
+	job, err := e.store.GetJob(ctx, in.JobID)
+	if err != nil {
+		return nil, err
+	}
+	if types.IsMaintenanceJob(job) {
+		return nil, &types.Error{Code: types.ErrInvalid, Operation: "organize", Detail: "Wiki maintenance uses the independent tool-capable model driver"}
+	}
 	return pipeline.Run(ctx, e.store, in)
 }
 

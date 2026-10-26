@@ -41,15 +41,21 @@ func parseTaxonomyAssignments(raw string) map[string][]string {
 	if raw == "" {
 		return nil
 	}
-	var parsed struct {
-		Assignments []struct {
-			Slug string   `json:"slug"` // Planned target knowledge.
-			Path []string `json:"path"` // Planned topic path.
-		} `json:"assignments"`
-	}
+	var parsed taxonomyAssignments
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return nil
 	}
+	return parsed.paths()
+}
+
+type taxonomyAssignments struct {
+	Assignments []struct {
+		Slug string   `json:"slug"` // 本批已提取的目标知识地址。
+		Path []string `json:"path"` // 为该目标规划的目录层级。
+	} `json:"assignments"` // 本批目标的目录归属建议。
+}
+
+func (parsed taxonomyAssignments) paths() map[string][]string {
 	out := make(map[string][]string, len(parsed.Assignments))
 	for _, a := range parsed.Assignments {
 		slug := strings.TrimSpace(a.Slug)

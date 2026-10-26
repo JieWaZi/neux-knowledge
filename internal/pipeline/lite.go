@@ -17,15 +17,16 @@ import (
 )
 
 const (
-	wikiMaxDocsPerBatch  = 5
-	wikiMapParallel      = 10
-	wikiReduceParallel   = 10
-	wikiLLMMaxAttempts   = 3
-	wikiLLMMaxTokens     = 32768
-	wikiLLMBackoffBase   = 2 * time.Second
-	wikiFollowUpDelay    = 5 * time.Second
-	wikiRateLimitBackoff = 60 * time.Second
-	maxContentForWiki    = 32768
+	wikiMaxDocsPerBatch                = 5
+	wikiMapParallel                    = 10
+	wikiReduceParallel                 = 10
+	wikiLLMMaxAttempts                 = 3
+	wikiLLMMaxTokens                   = 32768
+	wikiLLMBackoffBase                 = 2 * time.Second
+	wikiFollowUpDelay                  = 5 * time.Second
+	wikiRateLimitBackoff               = 60 * time.Second
+	maxContentForWiki                  = 32768
+	documentPlanModelValidationVersion = 1
 )
 
 // liteService holds the current organization scope for one library; separate model calls do not share conversations.
@@ -41,12 +42,12 @@ type liteService struct {
 
 // docIngestResult holds pure document Map results without writing Wiki pages before reduction.
 type docIngestResult struct {
-	source      *types.SourceVersion    // Immutable source.
-	artifact    ReadArtifact            // Completed source reading and indexed chunks.
-	updates     map[string][]SlugUpdate // Knowledge updates for each page.
-	summary     types.PageMutation      // Document summary page.
-	description string                  // One-sentence document summary.
-	profile     *types.KnowledgeProfile // Standard RAG document profile.
+	source      *types.SourceVersion    // 本次不可变来源。
+	artifact    ReadArtifact            // 已完成的来源阅读与索引分块。
+	updates     map[string][]SlugUpdate // 各目标页面的来源贡献。
+	summary     types.PageMutation      // 当前来源的摘要页面。
+	description string                  // 当前文档的一句话说明。
+	profile     *types.KnowledgeProfile // 普通检索资料的知识档案。
 }
 
 // Run executes a Lite work batch under a library lock; partial failures do not roll back successful pages.
@@ -245,18 +246,69 @@ func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSo
 		}
 	}
 	updates = s.remapSlugUpdatesByIdentity(ctx, s.job.LibraryID, updates, s.newBatchContext(pages))
-	// 仅缺失的来源贡献进入目录规划与 Reduce，已提交页面不重新调用模型。
+	pages, reconciliationFailures, err := s.reconcileArchivedSourceVersions(ctx, updates, pages, sources)
+	if err != nil {
+		return err
+	}
+	// 无法恢复确切旧材料的来源不发布本批任何贡献；兄弟来源仍可独立完成。
+	for i, result := range results {
+		if result != nil && reconciliationFailures[result.source.ID] != nil {
+			failures[i] = reconciliationFailures[result.source.ID]
+			results[i] = nil
+		}
+	}
+	for slug, list := range updates {
+		kept := []SlugUpdate{}
+		for _, u := range list {
+			if reconciliationFailures[u.SourceVersionID] == nil {
+				kept = append(kept, u)
+			}
+		}
+		if len(kept) == 0 {
+			delete(updates, slug)
+		} else {
+			updates[slug] = kept
+		}
+	}
+	// 仅缺失的来源贡献进入目录规划与Reduce。语义回执属于同一任务的不可变来源，不随旧计划重组的模型正文变化。
+	appliedCache := map[string]bool{}
+	checked := map[string]bool{}
+	contributionApplied := func(u SlugUpdate) (bool, error) {
+		identity := contributionHash(u)
+		if checked[identity] {
+			return appliedCache[identity], nil
+		}
+		applied, e := s.appliedContribution(ctx, u)
+		if e == nil {
+			checked[identity] = true
+			appliedCache[identity] = applied
+		}
+		return applied, e
+	}
 	for slug, list := range updates {
 		pending := []SlugUpdate{}
 		for _, u := range list {
-			applied, e := s.store.HasLiteContribution(ctx, s.job.ID, hash(marshal(u)))
+			applied, e := contributionApplied(u)
 			if e != nil {
 				return e
 			}
-			if applied {
-				continue
+			// 旧计划重组可能把本任务已提交的同版本页面重新列作旧贡献；该撤回没有旧版本可移除。
+			if !applied && (u.Type == "retract" || u.Type == "retractStale") {
+				for _, kind := range []string{types.WikiPageTypeConcept, types.WikiPageTypeEntity} {
+					prior := u
+					prior.Type = kind
+					applied, e = contributionApplied(prior)
+					if e != nil {
+						return e
+					}
+					if applied {
+						break
+					}
+				}
 			}
-			pending = append(pending, u)
+			if !applied {
+				pending = append(pending, u)
+			}
 		}
 		if len(pending) == 0 {
 			delete(updates, slug)
@@ -441,7 +493,21 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 		if plan.Artifact.SourceVersionID != source.ID || plan.Artifact.SHA256 != source.SHA256 {
 			return nil, invalid("stored document plan source changed")
 		}
-		return &docIngestResult{source: source, artifact: plan.Artifact, updates: plan.Updates, summary: plan.Summary, description: plan.Description, profile: plan.Profile}, nil
+		// 重组并保存新计划之前先继承真实旧回执；进程若在保存后退出，也不会丢失旧内容哈希到贡献身份的关联。
+		for _, updates := range plan.Updates {
+			for _, u := range updates {
+				if u.SourceVersionID != source.ID || u.KnowledgeID != source.SourceID {
+					return nil, invalid("stored document contribution source changed")
+				}
+				if _, e = s.appliedContribution(ctx, u); e != nil {
+					return nil, e
+				}
+			}
+		}
+		// 旧计划可能在完整输出检查之前冻结了截断摘要；先校验身份，再重新组装不可信版本。
+		if !s.library.IndexingStrategy.WikiEnabled || plan.ModelValidationVersion == documentPlanModelValidationVersion {
+			return &docIngestResult{source: source, artifact: plan.Artifact, updates: plan.Updates, summary: plan.Summary, description: plan.Description, profile: plan.Profile}, nil
+		}
 	}
 	raw, err := s.store.ReadRaw(ctx, s.job.LibraryID, source.ID)
 	if err != nil {
@@ -503,6 +569,9 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 		}
 		profile, e := parseDocumentSummaryOutput(output)
 		if e != nil {
+			if recordErr := s.markParseError(ctx, "document_summary", source.ID, output, e); recordErr != nil {
+				return nil, recordErr
+			}
 			return nil, e
 		}
 		result.description = profile.Summary
@@ -533,7 +602,7 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 			result.updates[update.Slug] = append(result.updates[update.Slug], update)
 		}
 	}
-	plan := documentPlan{Artifact: result.artifact, Updates: result.updates, Summary: result.summary, Description: result.description, Profile: result.profile}
+	plan := documentPlan{ModelValidationVersion: documentPlanModelValidationVersion, Artifact: result.artifact, Updates: result.updates, Summary: result.summary, Description: result.description, Profile: result.profile}
 	if err = s.store.SaveLitePlan(ctx, s.job.ID, s.job.Attempt, source.ID, string(marshal(plan))); err != nil {
 		return nil, err
 	}
@@ -542,15 +611,40 @@ func (s *liteService) mapDocument(ctx context.Context, w *types.OrganizeSourceWo
 
 // documentPlan 是可信管线的恢复结果，不是额外模型调用或新的知识事实。
 type documentPlan struct {
-	Artifact    ReadArtifact            // 已完成的原件阅读与分块。
-	Updates     map[string][]SlugUpdate // 按页面整理的不可变来源贡献。
-	Summary     types.PageMutation      // 原件摘要的初始发布内容。
-	Description string                  // 来源的一句话说明。
-	Profile     *types.KnowledgeProfile // 非 Wiki 文档的知识档案。
+	ModelValidationVersion int                     // 模型产物通过当前完整输出与解析校验的内部版本。
+	Artifact               ReadArtifact            // 已完成的原件阅读与分块。
+	Updates                map[string][]SlugUpdate // 按页面整理的不可变来源贡献。
+	Summary                types.PageMutation      // 原件摘要的初始发布内容。
+	Description            string                  // 来源的一句话说明。
+	Profile                *types.KnowledgeProfile // 非 Wiki 文档的知识档案。
 }
 
+// contributionHash 以不可变来源、目标和贡献职责为身份；实体与概念可精确复用同一页，二者同属新增贡献。
+func contributionHash(update SlugUpdate) string {
+	kind := update.Type
+	if kind == types.WikiPageTypeConcept || kind == types.WikiPageTypeEntity {
+		kind = "addition"
+	}
+	return hash(marshal([]string{"source-contribution", update.SourceVersionID, update.Slug, kind}))
+}
+
+// appliedContribution 仅从真实已提交回执继承稳定身份，兼容早期完整内容哈希及实体、概念分别命名的语义回执。
+func (s *liteService) appliedContribution(ctx context.Context, update SlugUpdate) (bool, error) {
+	identity := contributionHash(update)
+	applied, err := s.store.HasLiteContribution(ctx, s.job.ID, identity)
+	if err != nil || applied {
+		return applied, err
+	}
+	legacyHashes := []string{hash(marshal(update))}
+	if update.Type == types.WikiPageTypeConcept || update.Type == types.WikiPageTypeEntity {
+		for _, kind := range []string{types.WikiPageTypeConcept, types.WikiPageTypeEntity} {
+			legacyHashes = append(legacyHashes, hash(marshal([]string{"source-contribution", update.SourceVersionID, update.Slug, kind})))
+		}
+	}
+	return s.store.AdoptLiteContribution(ctx, s.job.ID, s.job.Attempt, identity, legacyHashes)
+}
 func (s *liteService) contributionKey(update SlugUpdate) string {
-	return "lite/" + s.job.ID + "/applied/" + hash(marshal(update))
+	return "lite/" + s.job.ID + "/applied/" + contributionHash(update)
 }
 
 // combinedExtraction preserves the upstream JSON contract without adding a host result wrapper.
@@ -566,9 +660,8 @@ func (s *liteService) classifyUpstream(ctx context.Context, sourceID, candidateX
 		return nil, nil, 0
 	}
 	parallel(ctx, len(batches), maxCitationBatchConcurrency, func(i int) {
-		raw, err := s.generate(ctx, "cite", sourceID, []string{sourceID}, wiki.WikiChunkCitationPrompt, map[string]string{"CandidateSlugs": candidateXML, "ChunksXML": renderChunksXML(batches[i]), "Language": lang})
-		if err == nil {
-			_ = json.Unmarshal([]byte(cleanLLMJSON(raw)), &results[i])
+		if err := s.generateJSON(ctx, "cite", sourceID, []string{sourceID}, wiki.WikiChunkCitationPrompt, map[string]string{"CandidateSlugs": candidateXML, "ChunksXML": renderChunksXML(batches[i]), "Language": lang}, &results[i]); err != nil {
+			results[i] = citationBatchResult{}
 		}
 	})
 	set := map[string]map[string]bool{}

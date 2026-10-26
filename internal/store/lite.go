@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+const (
+	// liteJobDiagnosticSamples 限制任务终态展示的失败来源预览，完整诊断仍归原件所有。
+	liteJobDiagnosticSamples = 3
+	// liteJobDiagnosticRunes 限制每条冻结摘要的字符数，不读取或保存来源正文。
+	liteJobDiagnosticRunes = 500
+)
+
 // PublishLite atomically commits results from the trusted Lite algorithm; model text cannot access this entry point.
 func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attempt int, p *types.Publication, contributionKeys ...string) (*types.Receipt, error) {
 	input := struct {
@@ -62,12 +69,13 @@ func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attemp
 		}
 		structureChanged := false
 		for _, m := range p.Themes {
-			if _, err = applyTheme(tx, l, m, true, pageEdit{job: j}); err != nil {
+			if _, _, err = applyTheme(tx, l, m, true, pageEdit{job: j}); err != nil {
 				return nil, err
 			}
 			structureChanged = true
 		}
 		pageIDs := []string{}
+		pageVersion := 0
 		for _, m := range p.Pages {
 			page := m.Page
 			changed, e := writePageWithEdit(tx, l, &page, m.ExpectedVersion, true, allowed, pageEdit{job: j})
@@ -76,13 +84,14 @@ func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attemp
 			}
 			structureChanged = structureChanged || changed
 			pageIDs = append(pageIDs, page.ID)
+			pageVersion = page.Version
 		}
 		// 成功回执必须与页面写入原子提交，崩溃恢复不能再次应用同一贡献。
 		if len(contributionKeys) > 0 && len(p.Pages) != 1 {
 			return nil, fail(types.ErrInvalid, "lite.publish", "contribution checkpoint requires one page")
 		}
 		for _, key := range contributionKeys {
-			row := types.Receipt{RequestID: key, Digest: digest(key), LibraryID: l.ID, JobID: j.ID, JobAttempt: j.Attempt, State: "applied", PageIDs: pageIDs}
+			row := types.Receipt{RequestID: key, Digest: digest(key), LibraryID: l.ID, JobID: j.ID, JobAttempt: j.Attempt, Version: int64(pageVersion), State: "applied", PageIDs: pageIDs}
 			if err = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
 				return nil, err
 			}
@@ -163,6 +172,7 @@ func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attemp
 			}
 		}
 		state := "processing"
+		diagnostics := []string{}
 		if p.Final {
 			var all []types.SourceVersion
 			if err = tx.Where("id IN ?", j.SourceVersionIDs).Find(&all).Error; err != nil {
@@ -180,6 +190,13 @@ func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attemp
 				case "processed", "no-change":
 				case "failed", "cancelled":
 					failed++
+					if len(diagnostics) < liteJobDiagnosticSamples {
+						text := []rune(strings.TrimSpace(v.Filename) + ": " + strings.TrimSpace(v.Diagnostic))
+						if len(text) > liteJobDiagnosticRunes {
+							text = text[:liteJobDiagnosticRunes]
+						}
+						diagnostics = append(diagnostics, string(text))
+					}
 				default:
 					return nil, fail(types.ErrCandidateInvalid, "publish", "final publication has incomplete sources")
 				}
@@ -192,7 +209,12 @@ func (s *Store) PublishLite(ctx context.Context, requestID, jobID string, attemp
 				state = "failed"
 			}
 		}
-		r := tx.Model(&types.Job{}).Where("id = ? AND version = ? AND attempt = ? AND cancel_requested = ?", j.ID, j.Version, j.Attempt, false).Updates(map[string]any{"version": j.Version + 1, "structure_version": l.StructureVersion, "state": state, "updated_at": time.Now().UnixMilli()})
+		updates := map[string]any{"version": j.Version + 1, "structure_version": l.StructureVersion, "state": state, "updated_at": time.Now().UnixMilli()}
+		if p.Final {
+			// 与真实终态一起冻结当前尝试的有界失败摘要，复用上面的来源读取，不在活动列表逐条补诊断。
+			updates["diagnostic"] = strings.Join(diagnostics, "\n")
+		}
+		r := tx.Model(&types.Job{}).Where("id = ? AND version = ? AND attempt = ? AND cancel_requested = ?", j.ID, j.Version, j.Attempt, false).Updates(updates)
 		if r.Error != nil {
 			return nil, r.Error
 		}
@@ -315,10 +337,26 @@ func nullableJSON(value any) any {
 	return string(raw)
 }
 
-// ListWikiFinalizeOps reads the bounded finalization updates actually published by this task.
+// ListWikiFinalizeOps 读取同任务全部已发布收尾意图；显式重试不丢弃旧尝试尚未完成的页面与文档变化。
 func (s *Store) ListWikiFinalizeOps(ctx context.Context, jobID string, attempt int) (items []*types.WikiFinalizeOp, err error) {
 	err = s.transaction(ctx, func(tx *gorm.DB) error {
-		return tx.Where("job_id = ? AND job_attempt = ?", jobID, attempt).Order("created_at ASC, key ASC").Find(&items).Error
+		return tx.Where("job_id = ? AND job_attempt <= ?", jobID, attempt).Order("job_attempt ASC, created_at ASC, key ASC").Find(&items).Error
+	})
+	return
+}
+
+// ListSourceContributionPages 按稳定来源身份读取完整贡献集合，包含归档页而不扫描无关正文到管线内存。
+func (s *Store) ListSourceContributionPages(ctx context.Context, libraryID string, sourceIDs []string, afterSlug string, limit int) (items []*types.WikiPage, err error) {
+	if len(sourceIDs) == 0 {
+		return nil, nil
+	}
+	if len(sourceIDs) > 1000 || limit < 1 || limit > 100 {
+		return nil, fail(types.ErrInvalid, "lite.source-pages", "source scope or page batch exceeds supported bound")
+	}
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		return tx.Where("knowledge_base_id = ? AND slug > ?", libraryID, afterSlug).
+			Where("EXISTS (SELECT 1 FROM json_each(evidence, '$.sources') WHERE json_extract(value, '$.sourceId') IN ?)", sourceIDs).
+			Order("slug ASC").Limit(limit).Find(&items).Error
 	})
 	return
 }
@@ -407,6 +445,53 @@ func (s *Store) SaveLitePlan(ctx context.Context, jobID string, attempt int, sou
 	})
 }
 
+// HasCurrentLitePageCheckpoint 确认单页阶段已提交且仍归本任务版本所有，恢复时保留权限与读取时间校验。
+func (s *Store) HasCurrentLitePageCheckpoint(ctx context.Context, jobID string, attempt int, key string, page *types.WikiPage) (applied bool, err error) {
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		applied = false
+		j, l, e := activeJob(tx, jobID)
+		if e != nil {
+			return e
+		}
+		if j.Attempt != attempt {
+			return fail(types.ErrStaleAttempt, "lite.page-checkpoint", "job attempt changed")
+		}
+		if j.StructureVersion != l.StructureVersion {
+			return fail(types.ErrVersionConflict, "lite.page-checkpoint", "library structure changed")
+		}
+		var marker types.Receipt
+		e = tx.Where("request_id = ? AND job_id = ? AND job_attempt <= ? AND state = ?", key, j.ID, attempt, "applied").Take(&marker).Error
+		if errors.Is(e, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		if page == nil || len(marker.PageIDs) != 1 || marker.PageIDs[0] != page.ID {
+			return fail(types.ErrVersionConflict, "lite.page-checkpoint", "checkpoint page changed")
+		}
+		current, e := getPage(tx, l.ID, page.ID)
+		if e != nil {
+			return e
+		}
+		if marker.Version != int64(current.Version) || current.Version != page.Version || page.UpdatedAt.IsZero() || current.UpdatedAt.UnixMilli() != page.UpdatedAt.UnixMilli() {
+			return fail(types.ErrVersionConflict, "lite.page-checkpoint", "committed page changed")
+		}
+		// 原文未变的首次发布可能没有任务内容版本回执；阶段回执仍固定其实际提交版本。
+		var version types.Receipt
+		e = tx.Where("request_id = ?", jobPageVersionKey(j, current.ID)).Take(&version).Error
+		if e == nil && (version.Version != int64(current.Version) || current.LastEditSource != types.WikiEditSourcePipeline) {
+			return fail(types.ErrVersionConflict, "lite.page-checkpoint", "another edit superseded this job version")
+		}
+		if e != nil && !errors.Is(e, gorm.ErrRecordNotFound) {
+			return e
+		}
+		applied = true
+		return nil
+	})
+	return
+}
+
 // HasLiteContribution 查询同一任务已提交的来源贡献，兼容早期按尝试保存的回执。
 func (s *Store) HasLiteContribution(ctx context.Context, jobID, contributionHash string) (bool, error) {
 	var row types.Receipt
@@ -417,4 +502,38 @@ func (s *Store) HasLiteContribution(ctx context.Context, jobID, contributionHash
 		return false, nil
 	}
 	return err == nil, translate("lite.contribution.read", err)
+}
+
+// AdoptLiteContribution 仅将已原子提交的旧内容回执映射到稳定贡献身份，不凭模型的新正文确认成功。
+func (s *Store) AdoptLiteContribution(ctx context.Context, jobID string, attempt int, identity string, legacyHashes []string) (applied bool, err error) {
+	err = s.transaction(ctx, func(tx *gorm.DB) error {
+		j, _, e := activeJob(tx, jobID)
+		if e != nil {
+			return e
+		}
+		if j.Attempt != attempt {
+			return fail(types.ErrStaleAttempt, "lite.contribution-adopt", "job attempt changed")
+		}
+		for _, h := range legacyHashes {
+			var marker types.Receipt
+			key := "lite/" + jobID + "/applied/" + h
+			legacy := "lite/" + jobID + "/%/applied/" + h
+			e = tx.Where("job_id = ? AND job_attempt <= ? AND state = ? AND (request_id = ? OR request_id LIKE ?)", jobID, attempt, "applied", key, legacy).Take(&marker).Error
+			if errors.Is(e, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if e != nil {
+				return e
+			}
+			marker.RequestID = "lite/" + jobID + "/applied/" + identity
+			marker.Digest = digest(marker.RequestID)
+			if e = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&marker).Error; e != nil {
+				return e
+			}
+			applied = true
+			return nil
+		}
+		return nil
+	})
+	return
 }

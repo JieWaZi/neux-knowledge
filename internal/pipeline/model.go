@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -18,6 +19,45 @@ func (s *liteService) generate(ctx context.Context, stage, sourceID string, sour
 	output, err := s.generatePrompt(ctx, stage, sourceID, sourceIDs, prompt)
 	return unmaskImageURLs(output, urlMap), err
 }
+
+// generateJSON 先解析模型原文，再还原结构化字符串中的图片地址，避免地址破坏 JSON 转义。
+func (s *liteService) generateJSON(ctx context.Context, kind, sourceID string, sourceIDs []string, tpl string, data map[string]string, target any) error {
+	masked, urlMap := maskTemplateDataImageURLs(data)
+	prompt, err := wiki.RenderLitePrompt(tpl, masked)
+	if err != nil {
+		return err
+	}
+	raw, err := s.generatePrompt(ctx, kind, sourceID, sourceIDs, prompt)
+	if err != nil {
+		return err
+	}
+	if err = json.Unmarshal([]byte(cleanLLMJSON(raw)), target); err != nil {
+		stageSourceID := ""
+		if len(sourceIDs) == 1 {
+			stageSourceID = sourceIDs[0]
+		}
+		if recordErr := s.markParseError(ctx, kind, stageSourceID, raw, err); recordErr != nil {
+			return recordErr
+		}
+		return invalid("parse " + kind + " JSON: " + err.Error())
+	}
+	if len(urlMap) == 0 {
+		return nil
+	}
+	// 仅在已验证的目标类型上恢复地址，保留调用方既有字段和数字类型。
+	// 地址先编码成 JSON 字符串片段，因此任意嵌套值中的引号、反斜线和控制字符均不会破坏结构。
+	encoded, err := json.Marshal(target)
+	if err != nil {
+		return err
+	}
+	escapedURLs := make(map[string]string, len(urlMap))
+	for token, url := range urlMap {
+		escaped, _ := json.Marshal(url)
+		escapedURLs[token] = string(escaped[1 : len(escaped)-1])
+	}
+	return json.Unmarshal([]byte(unmaskImageURLs(string(encoded), escapedURLs)), target)
+}
+
 func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string, sourceIDs []string, prompt wiki.StagePrompt) (string, error) {
 	messages := []ModelMessage{}
 	if prompt.System != "" {
@@ -37,7 +77,7 @@ func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string,
 	var callErr error
 	var totalUsage *types.ModelUsage
 	var output strings.Builder
-	canContinue := kind == "reduce"
+	canContinue := kind == "reduce" || kind == "summary"
 	for round := 0; round <= 3; round++ {
 		for attempt := 1; attempt <= wikiLLMMaxAttempts; attempt++ {
 			req := GenerateRequest{JobID: s.job.ID, SourceVersionID: sourceID, StageID: st.ID, Stage: kind, Messages: append([]ModelMessage{}, messages...), Temperature: .3, Thinking: false, MaxTokens: maxTokensForStage(kind)}
@@ -68,6 +108,10 @@ func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string,
 			result.FinishReason = "stop"
 			break
 		}
+		if round > 0 && strings.TrimSpace(result.Text) == "" {
+			callErr = invalid("model returned empty continuation for a truncated wiki page")
+			break
+		}
 		output.WriteString(result.Text)
 		if !canContinue || !isLengthStop(result.FinishReason) {
 			break
@@ -78,8 +122,8 @@ func (s *liteService) generatePrompt(ctx context.Context, kind, sourceID string,
 		}
 		messages = append(messages, ModelMessage{Role: "assistant", Content: result.Text}, ModelMessage{Role: "user", Content: wiki.WikiPageModifyContinuationPrompt})
 	}
-	if callErr == nil && kind == "document_summary" && isLengthStop(result.FinishReason) {
-		callErr = invalid("document summary response was truncated")
+	if callErr == nil && !canContinue && isLengthStop(result.FinishReason) {
+		callErr = invalid(kind + " response was truncated")
 	}
 	if callErr == nil && strings.TrimSpace(output.String()) == "" {
 		callErr = invalid("model returned empty output")
@@ -108,10 +152,10 @@ func isLengthStop(reason string) bool {
 	return false
 }
 
-func (s *liteService) markParseError(ctx context.Context, kind, sourceID, raw string, cause error) {
+func (s *liteService) markParseError(ctx context.Context, kind, sourceID, raw string, cause error) error {
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	_ = s.store.RecordModelParseFailure(cleanup, s.job.ID, kind, sourceID, raw, cause.Error())
+	return s.store.RecordModelParseFailure(cleanup, s.job.ID, kind, sourceID, raw, cause.Error())
 }
 
 func maxTokensForStage(kind string) int {
