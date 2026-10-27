@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -28,6 +29,11 @@ func isTransientLLMError(ctx context.Context, err error) bool {
 	// Never retry after the parent ctx itself expired — the task is
 	// being cancelled and the next attempt would just fail again.
 	if ctx.Err() != nil {
+		return false
+	}
+	// Calls with accepted side effects may explicitly forbid replay.
+	var retryMarker interface{ Retryable() bool }
+	if errors.As(err, &retryMarker) && !retryMarker.Retryable() {
 		return false
 	}
 
