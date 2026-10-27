@@ -53,7 +53,7 @@ func Open(ctx context.Context, dbPath, rawDir string) (*Store, error) {
 	if err != nil {
 		return nil, wrap(types.ErrStorage, "open", err)
 	}
-	conn, err := sqlitedriver.Open((&url.URL{Scheme: "file", Path: dbPath}).String(), func(c *sqlite3.Conn) error {
+	conn, err := sqlitedriver.Open(databaseURI(dbPath), func(c *sqlite3.Conn) error {
 		// 还原 SQLite 原生零忙等待，由核心完整事务重试处理竞争。
 		if err := c.BusyTimeout(0); err != nil {
 			return err
@@ -395,4 +395,9 @@ func bumpStructure(tx *gorm.DB, l *types.Library) error {
 	}
 	l.StructureVersion++
 	return nil
+}
+
+// databaseURI 仅编码文件名，不把相对路径或Windows盘符解释为URI主机。
+func databaseURI(path string) string {
+	return (&url.URL{Scheme: "file", Opaque: url.PathEscape(path)}).String()
 }
