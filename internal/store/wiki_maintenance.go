@@ -196,10 +196,20 @@ func (s *Store) DeletePage(ctx context.Context, in types.DeletePageInput) (*type
 		if p.Status == "archived" {
 			return nil, fail(types.ErrInvalid, "page.delete", "page is already archived")
 		}
-		rewrite := func(content string) string {
-			return wiki.RewritePageLinks(content, p.Slug, "")
+		newSlug := ""
+		if in.CanonicalPageID != "" {
+			canonical, err := duplicateCanonical(tx, l, p, in)
+			if err != nil {
+				return nil, err
+			}
+			newSlug = canonical.Slug
+		} else if in.CanonicalExpectedVersion != 0 || in.CanonicalExpectedUpdatedAt != "" {
+			return nil, fail(types.ErrInvalid, "page.delete", "canonical page identity is required")
 		}
-		ids, err := rewriteIncomingPages(tx, l, p.ID, p.Slug, "", rewrite, false)
+		rewrite := func(content string) string {
+			return wiki.RewritePageLinks(content, p.Slug, newSlug)
+		}
+		ids, err := rewriteIncomingPages(tx, l, p.ID, p.Slug, newSlug, rewrite, false)
 		if err != nil {
 			return nil, err
 		}
@@ -217,10 +227,103 @@ func (s *Store) DeletePage(ctx context.Context, in types.DeletePageInput) (*type
 	})
 }
 
+// duplicateCanonical 在同一写事务内核对归并两端的版本、正文时间及真实库归属。
+func duplicateCanonical(tx *gorm.DB, l *types.Library, old *types.WikiPage, in types.DeletePageInput) (*types.WikiPage, error) {
+	if in.CanonicalPageID == "" || in.CanonicalPageID == old.ID {
+		return nil, fail(types.ErrInvalid, "page.consolidate", "a different canonical page is required")
+	}
+	current, err := time.Parse(time.RFC3339Nano, in.ExpectedUpdatedAt)
+	if err != nil {
+		return nil, fail(types.ErrInvalid, "page.consolidate", "target timestamp is required")
+	}
+	if !old.UpdatedAt.Equal(current) {
+		return nil, fail(types.ErrVersionConflict, "page.consolidate", "target content changed")
+	}
+	canonical, err := maintenancePage(tx, l, in.CanonicalPageID, in.CanonicalExpectedVersion)
+	if err != nil {
+		return nil, err
+	}
+	current, err = time.Parse(time.RFC3339Nano, in.CanonicalExpectedUpdatedAt)
+	if err != nil {
+		return nil, fail(types.ErrInvalid, "page.consolidate", "canonical timestamp is required")
+	}
+	if !canonical.UpdatedAt.Equal(current) {
+		return nil, fail(types.ErrVersionConflict, "page.consolidate", "canonical content changed")
+	}
+	if canonical.Status != "published" || canonical.ParentSlug == old.Slug {
+		return nil, fail(types.ErrInvalid, "page.consolidate", "canonical page must be published and independent of the redundant parent")
+	}
+	visited := map[string]bool{canonical.Slug: true}
+	for parent := canonical.ParentSlug; parent != ""; {
+		if parent == old.Slug || visited[parent] {
+			return nil, fail(types.ErrInvalid, "page.consolidate", "canonical ancestry would become cyclic")
+		}
+		visited[parent] = true
+		var ancestor types.WikiPage
+		if err := tx.Select("parent_slug").Where("knowledge_base_id = ? AND slug = ?", l.ID, parent).Take(&ancestor).Error; err != nil {
+			return nil, err
+		}
+		parent = ancestor.ParentSlug
+	}
+	return canonical, nil
+}
+
+// pagePurgeMutation 在领域事务内保留已删除页的真实标题用于活动记录，标题不进入调用摘要。
+type pagePurgeMutation struct {
+	types.PurgePageInput        // 调用方提交的完整永久删除输入。
+	title                string // 事务内读取的旧页标题。
+}
+
+// PurgePage 仅永久删除已归档重复页及其版本和问题记录，不清理原件与规范页。
+func (s *Store) PurgePage(ctx context.Context, in types.PurgePageInput) (*types.Receipt, error) {
+	mutation := &pagePurgeMutation{PurgePageInput: in}
+	return s.mutate(ctx, in.RequestID, "page.purge", in.LibraryID, mutation, func(tx *gorm.DB) (*types.Receipt, error) {
+		l, err := maintenanceLibrary(tx, in.LibraryID, in.StructureVersion, in.ExpectedPolicyVersion)
+		if err != nil {
+			return nil, err
+		}
+		p, err := maintenancePage(tx, l, in.PageID, in.ExpectedVersion)
+		if err != nil {
+			return nil, err
+		}
+		if p.Status != "archived" {
+			return nil, fail(types.ErrInvalid, "page.purge", "only archived pages can be permanently deleted")
+		}
+		canonical, err := duplicateCanonical(tx, l, p, in)
+		if err != nil {
+			return nil, err
+		}
+		ids, err := rewriteIncomingPages(tx, l, p.ID, p.Slug, canonical.Slug, func(content string) string {
+			return wiki.RewritePageLinks(content, p.Slug, canonical.Slug)
+		}, false)
+		if err != nil {
+			return nil, err
+		}
+		if err = tx.Unscoped().Where("knowledge_base_id = ? AND page_id = ?", l.ID, p.ID).Delete(&types.WikiPageRevision{}).Error; err != nil {
+			return nil, err
+		}
+		if err = tx.Unscoped().Where("knowledge_base_id = ? AND slug = ?", l.ID, p.Slug).Delete(&types.WikiPageIssue{}).Error; err != nil {
+			return nil, err
+		}
+		if err = tx.Unscoped().Where("knowledge_base_id = ? AND id = ?", l.ID, p.ID).Delete(&types.WikiPage{}).Error; err != nil {
+			return nil, err
+		}
+		if err = bumpStructure(tx, l); err != nil {
+			return nil, err
+		}
+		if err = refreshBacklinks(tx, l.ID); err != nil {
+			return nil, err
+		}
+		mutation.title = p.Title
+		return &types.Receipt{ResourceID: p.ID, Version: int64(p.Version + 1), PageIDs: append([]string{p.ID}, ids...), State: "saved"}, nil
+	})
+}
+
 func rewriteIncomingPages(tx *gorm.DB, l *types.Library, exclude, oldSlug, newSlug string, rewrite func(string) string, preserveProtected bool) ([]string, error) {
 	var pages []*types.WikiPage
+	linkSlug := wiki.NormalizeLinkSlug(oldSlug)
 	// Use a single-table candidate query within the library; exact Markdown matching still uses the rewrite rules so wildcards cannot expand scope.
-	if err := tx.Where("knowledge_base_id = ? AND id <> ? AND (CAST(out_links AS TEXT) LIKE ? ESCAPE '\\' OR parent_slug = ?)", l.ID, exclude, "%"+escapeLikePattern(oldSlug)+"%", oldSlug).Order("id ASC").Find(&pages).Error; err != nil {
+	if err := tx.Where("knowledge_base_id = ? AND id <> ? AND (CAST(out_links AS TEXT) LIKE ? ESCAPE '\\' OR parent_slug = ?)", l.ID, exclude, "%"+escapeLikePattern(linkSlug)+"%", oldSlug).Order("id ASC").Find(&pages).Error; err != nil {
 		return nil, err
 	}
 	ids := []string{}
@@ -230,7 +333,7 @@ func rewriteIncomingPages(tx *gorm.DB, l *types.Library, exclude, oldSlug, newSl
 			continue
 		}
 		updated := p.Content
-		if slices.Contains(p.OutLinks, oldSlug) {
+		if slices.Contains(p.OutLinks, linkSlug) {
 			updated = rewrite(p.Content)
 		}
 		parentChanged := p.ParentSlug == oldSlug

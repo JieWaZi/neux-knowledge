@@ -36,6 +36,7 @@ type (
 	ReplacePageTextInput = types.ReplacePageTextInput
 	RenamePageInput      = types.RenamePageInput
 	DeletePageInput      = types.DeletePageInput
+	PurgePageInput       = types.PurgePageInput
 	RestorePageInput     = types.RestorePageInput
 	WriteThemeInput      = types.WriteThemeInput
 	AcceptJobInput       = types.AcceptJobInput

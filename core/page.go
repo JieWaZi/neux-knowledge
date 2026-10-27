@@ -62,9 +62,14 @@ func (e *Engine) RenamePage(ctx context.Context, in RenamePageInput) (*Receipt, 
 	return e.store.RenamePage(ctx, in)
 }
 
-// DeletePage archives the current page and atomically removes inbound links while retaining revision history.
+// DeletePage 归档页面并保留历史；提供规范页及双端守卫时原子改向入链，普通归档移除入链。
 func (e *Engine) DeletePage(ctx context.Context, in DeletePageInput) (*Receipt, error) {
 	return e.store.DeletePage(ctx, in)
+}
+
+// PurgePage 永久删除已归档重复页及其历史，同事务校验规范页并将剩余引用指向规范页。
+func (e *Engine) PurgePage(ctx context.Context, in PurgePageInput) (*Receipt, error) {
+	return e.store.PurgePage(ctx, in)
 }
 
 // ListPageDirectory 只查询目录展示字段，不读取正文、证据和引用关系。

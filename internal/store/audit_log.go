@@ -145,7 +145,7 @@ func sanitizeActivityDetails(details map[string]any) types.JSON {
 	safe := map[string]any{}
 	for key, value := range details {
 		switch key {
-		case "title", "task_id", "trigger", "processing_status", "via", "scope":
+		case "title", "task_id", "trigger", "processing_status", "via", "scope", "canonicalPageId":
 			if text, ok := value.(string); ok {
 				runes := []rune(text)
 				if len(runes) > 200 {
@@ -266,6 +266,14 @@ func appendMutationActivity(ctx context.Context, tx *gorm.DB, r *types.Receipt, 
 		details["count"] = len(r.PageIDs)
 		if err := appendActivityPageTitles(tx, r.LibraryID, r.PageIDs, details); err != nil {
 			return err
+		}
+	case "page.purge":
+		action = types.AuditActionWikiContentChanged
+		targetType, targetID = "wiki", r.LibraryID
+		details["count"] = len(r.PageIDs)
+		if in, ok := input.(*pagePurgeMutation); ok {
+			kbActivityAppendSampleTitles(details, in.title)
+			details["canonicalPageId"] = in.CanonicalPageID
 		}
 	case "source.import":
 		action = types.AuditActionKnowledgeCreated

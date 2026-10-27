@@ -71,6 +71,30 @@ func TestWikiMaintenanceCascadeRollsBackEveryRow(t *testing.T) {
 	}
 }
 
+func TestArchiveReplayKeepsLegacyInputDigest(t *testing.T) {
+	ctx := context.Background()
+	s, l, _, _ := sourceWorkFixture(t)
+	// 旧版持久摘要只包含这六个字段；升级不能改变同一普通归档请求的身份。
+	legacy := struct {
+		RequestID             string // 旧请求身份。
+		LibraryID             string // 原知识库。
+		PageID                string // 原页面身份。
+		ExpectedVersion       int    // 原页面版本。
+		StructureVersion      int64  // 原目录版本。
+		ExpectedPolicyVersion int64  // 原策略版本。
+	}{"legacy-archive", l.ID, "old-page", 1, l.StructureVersion, l.PolicyVersion}
+	prior, err := s.mutate(ctx, legacy.RequestID, "page.delete", l.ID, legacy, func(*gorm.DB) (*types.Receipt, error) {
+		return &types.Receipt{ResourceID: legacy.PageID, Version: 2, State: "saved"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.DeletePage(ctx, types.DeletePageInput{RequestID: legacy.RequestID, LibraryID: legacy.LibraryID, PageID: legacy.PageID, ExpectedVersion: legacy.ExpectedVersion, StructureVersion: legacy.StructureVersion, ExpectedPolicyVersion: legacy.ExpectedPolicyVersion})
+	if err != nil || got.CreatedAt != prior.CreatedAt {
+		t.Fatalf("upgrade invalidated original archive receipt: %+v %v", got, err)
+	}
+}
+
 func TestAgentEvidenceUsesPersistedChunkLocator(t *testing.T) {
 	ctx := context.Background()
 	s, l, source, job := sourceWorkFixture(t)

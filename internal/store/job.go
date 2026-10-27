@@ -71,7 +71,7 @@ func checkMaintenanceWrite(ctx context.Context, tx *gorm.DB, operation, libraryI
 		return fail(types.ErrVersionConflict, operation, "maintenance task has not started")
 	}
 	switch operation {
-	case "page.agent-write", "page.replace-text", "page.rename", "page.delete", "page.restore", "theme.write", "wiki.auto-fix", "wiki.maintenance.complete":
+	case "page.agent-write", "page.replace-text", "page.rename", "page.delete", "page.purge", "page.restore", "theme.write", "wiki.auto-fix", "wiki.maintenance.complete":
 		return nil
 	default:
 		return fail(types.ErrScopeViolation, operation, "maintenance cannot process originals or change library policy")

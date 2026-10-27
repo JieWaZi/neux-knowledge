@@ -5,6 +5,9 @@ import (
 	"strings"
 )
 
+// NormalizeLinkSlug 返回与出链解析及正文重写一致的页面地址身份。
+func NormalizeLinkSlug(slug string) string { return normalizeSlug(slug) }
+
 // ParseOutLinks projects outgoing links from actual Markdown bodies without accepting caller-fabricated relation fields.
 func ParseOutLinks(content string) []string {
 	// Reuse the link scanner's code-span detection so links in example code do not become relations.
