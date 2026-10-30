@@ -213,9 +213,14 @@ func (s *liteService) publish(ctx context.Context, name string, p *types.Publica
 	return rec, err
 }
 func (s *liteService) processBatch(ctx context.Context, work []*types.OrganizeSourceWork) error {
-	pages, err := s.pages(ctx)
-	if err != nil {
-		return err
+	var pages []*types.WikiPage
+	var err error
+	// 普通资料摘要与检索索引不消费 Wiki 页面；只有 Wiki 整理需要去重和 Reduce 上下文。
+	if s.library.IndexingStrategy.WikiEnabled {
+		pages, err = s.pages(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	results := make([]*docIngestResult, len(work))
 	failures := make([]error, len(work))

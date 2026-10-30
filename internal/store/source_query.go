@@ -2,100 +2,87 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 	"gorm.io/gorm"
 )
 
-// sourceActivity holds a lightweight state overlay for the current attempt without loading source contents.
+// sourceActivity 仅承载请求范围内来源的活动投影，不加载任务的完整来源集合。
 type sourceActivity struct {
-	State      string // Display state for the current attempt.
-	Diagnostic string // Current dead-letter diagnostic; other in-flight states clear stale diagnostics.
+	ID         string // 当前请求的来源版本标识。
+	SourceID   string // 跨版本稳定的原件身份。
+	State      string // 当前尝试的展示状态；空值表示沿用来源持久状态。
+	Diagnostic string // 当前死信诊断；其他在途状态清除旧诊断。
+	Occupied   bool   // 任一版本仍被在途任务占用。
 }
 
 // sourceActivitySnapshot 同时提供展示状态与原件占用，终态展示不能解除未结束任务的占用。
 type sourceActivitySnapshot struct {
-	Versions map[string]sourceActivity // 当前尝试对来源版本的展示状态。
-	Occupied map[string]bool           // 所有在途任务仍然拥有的原件身份。
+	Versions map[string]sourceActivity // 当前请求的来源版本展示状态。
+	Occupied map[string]bool           // 当前请求的原件占用状态。
 }
 
-// sourceActivities 汇总全部在途任务及其当前尝试，来源终态仍由原记录保存。
-func sourceActivities(tx *gorm.DB, libraryID string) (sourceActivitySnapshot, error) {
+// sourceActiveWorkSQL 从确切来源版本的反向索引定位工作关系，再按主键核对原任务的当前尝试与在途状态。
+func sourceActiveWorkSQL(sourceTable string) string {
+	return `FROM knowledge_organize_source_work AS source_work
+		WHERE source_work.source_version_id = ` + sourceTable + `.id
+		AND source_work.library_id = ` + sourceTable + `.library_id
+		AND EXISTS (SELECT 1 FROM knowledge_jobs AS source_job
+			WHERE source_job.id = source_work.job_id AND source_job.library_id = source_work.library_id
+			AND source_job.attempt = source_work.job_attempt
+			AND source_job.state IN ('queued','processing','cancel_requested'))`
+}
+
+// sourceActivityValueSQL 利用接纳时同原件只能由一个在途任务占用的约束，读取确切版本的唯一活动归属。
+func sourceActivityValueSQL(value string) string {
+	return `COALESCE((SELECT ` + value + ` ` + sourceActiveWorkSQL("knowledge_source_versions") + ` LIMIT 1), '')`
+}
+
+// sourceActivityStateSQL 与状态筛选共用同一表达式，当前尝试的 done 不能覆盖来源已保存的结论。
+func sourceActivityStateSQL() string {
+	return sourceActivityValueSQL(`CASE
+		WHEN source_work.state = 'done' THEN ''
+		WHEN source_work.state = 'dead' THEN 'failed'
+		WHEN source_work.started_at > 0 THEN 'processing'
+		ELSE 'queued' END`)
+}
+
+func sourceOccupiedSQL() string {
+	return `EXISTS (SELECT 1 FROM knowledge_source_versions AS occupied_source
+		WHERE occupied_source.library_id = knowledge_source_versions.library_id
+		AND occupied_source.source_id = knowledge_source_versions.source_id
+		AND EXISTS (SELECT 1 ` + sourceActiveWorkSQL("occupied_source") + `))`
+}
+
+// sourceActivities 只投影传入来源；其他版本的原件占用由持久事实相关子查询判断。
+func sourceActivities(tx *gorm.DB, libraryID string, sources []*types.SourceVersion) (sourceActivitySnapshot, error) {
 	result := sourceActivitySnapshot{Versions: map[string]sourceActivity{}, Occupied: map[string]bool{}}
-	var jobs []types.Job
-	if err := tx.Select("id,attempt,source_version_ids").Where("library_id = ? AND state IN ?", libraryID, []string{"queued", "processing", "cancel_requested"}).Find(&jobs).Error; err != nil {
-		return result, err
-	}
-	if len(jobs) == 0 {
-		return result, nil
-	}
-	versions := make([]string, 0)
-	seen := map[string]bool{}
-	for _, j := range jobs {
-		for _, id := range j.SourceVersionIDs {
-			if !seen[id] {
-				seen[id] = true
-				versions = append(versions, id)
-			}
+	ids := make([]string, 0, len(sources))
+	seen := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		if source != nil && !seen[source.ID] {
+			seen[source.ID] = true
+			ids = append(ids, source.ID)
 		}
 	}
-	for start := 0; start < len(versions); start += 500 {
+	diagnostic := sourceActivityValueSQL(`CASE WHEN source_work.state = 'dead' THEN source_work.diagnostic ELSE '' END`)
+	for start := 0; start < len(ids); start += 500 {
 		end := start + 500
-		if end > len(versions) {
-			end = len(versions)
+		if end > len(ids) {
+			end = len(ids)
 		}
-		var sources []types.SourceVersion
-		if err := tx.Select("source_id").Where("library_id = ? AND id IN ?", libraryID, versions[start:end]).Find(&sources).Error; err != nil {
+		var rows []sourceActivity
+		if err := tx.Model(&types.SourceVersion{}).
+			Select("id, source_id, "+sourceActivityStateSQL()+" AS state, "+diagnostic+" AS diagnostic, "+sourceOccupiedSQL()+" AS occupied").
+			Where("library_id = ? AND id IN ?", libraryID, ids[start:end]).Find(&rows).Error; err != nil {
 			return result, err
 		}
-		for _, source := range sources {
-			result.Occupied[source.SourceID] = true
-		}
-	}
-	var work []types.OrganizeSourceWork
-	for start := 0; start < len(jobs); start += 100 {
-		end := start + 100
-		if end > len(jobs) {
-			end = len(jobs)
-		}
-		clauses := make([]string, 0, end-start)
-		args := make([]any, 0, (end-start)*2)
-		for _, j := range jobs[start:end] {
-			clauses = append(clauses, "(job_id = ? AND job_attempt = ?)")
-			args = append(args, j.ID, j.Attempt)
-		}
-		var batch []types.OrganizeSourceWork
-		if err := tx.Select("job_id,job_attempt,source_version_id,state,diagnostic,started_at").Where(strings.Join(clauses, " OR "), args...).Find(&batch).Error; err != nil {
-			return result, err
-		}
-		work = append(work, batch...)
-	}
-	current := make(map[string]map[string]types.OrganizeSourceWork, len(jobs))
-	attempts := map[string]int{}
-	for _, j := range jobs {
-		attempts[j.ID] = j.Attempt
-		current[j.ID] = map[string]types.OrganizeSourceWork{}
-	}
-	for _, w := range work {
-		if attempts[w.JobID] == w.JobAttempt {
-			current[w.JobID][w.SourceVersionID] = w
-		}
-	}
-	for _, j := range jobs {
-		for _, id := range j.SourceVersionIDs {
-			w, ok := current[j.ID][id]
-			if ok && w.State == "done" {
-				continue
+		for _, row := range rows {
+			result.Occupied[row.SourceID] = row.Occupied
+			if row.State != "" {
+				result.Versions[row.ID] = row
 			}
-			activity := sourceActivity{State: "queued"}
-			if ok && w.State == "dead" {
-				activity.State, activity.Diagnostic = "failed", w.Diagnostic
-			} else if ok && w.StartedAt > 0 {
-				activity.State = "processing"
-			}
-			result.Versions[id] = activity
 		}
 	}
 	return result, nil
@@ -129,7 +116,7 @@ func (s *Store) SourceActivity(ctx context.Context, libraryID string, sources []
 				return fail(types.ErrScopeViolation, "source.activity", "source belongs to another library")
 			}
 		}
-		activity, e := sourceActivities(tx, libraryID)
+		activity, e := sourceActivities(tx, libraryID, sources)
 		if e != nil {
 			return e
 		}
@@ -166,34 +153,21 @@ func (s *Store) ListSourcesQuery(ctx context.Context, libraryID string, in types
 		if _, e := getLibrary(tx, libraryID, false); e != nil {
 			return e
 		}
-		activity, e := sourceActivities(tx, libraryID)
-		if e != nil {
-			return e
-		}
 		q := tx.Model(&types.SourceVersion{}).Where("library_id = ? AND archived = ?", libraryID, false)
 		if in.Query != "" {
 			q = q.Where("neux_source_contains(filename, ?) = 1", in.Query)
 		}
 		if state != "all" {
-			ids := map[string][]string{}
-			for id, a := range activity.Versions {
-				ids[a.State] = append(ids[a.State], id)
-			}
-			// Bind one JSON parameter per identity group to avoid exceeding SQLite's variable limit when many sources are active.
-			encoded := make(map[string]string, 3)
-			for _, key := range []string{"failed", "processing", "queued"} {
-				values, err := json.Marshal(ids[key])
-				if err != nil {
-					return err
-				}
-				encoded[key] = string(values)
-			}
-			q = q.Where("CASE WHEN state IN ('processed','no-change') THEN state WHEN id IN (SELECT value FROM json_each(?)) THEN 'failed' WHEN id IN (SELECT value FROM json_each(?)) THEN 'processing' WHEN id IN (SELECT value FROM json_each(?)) THEN 'queued' ELSE state END = ?", encoded["failed"], encoded["processing"], encoded["queued"], state)
+			q = q.Where("CASE WHEN state IN ('processed','no-change') THEN state ELSE COALESCE(NULLIF("+sourceActivityStateSQL()+", ''), state) END = ?", state)
 		}
-		if e = q.Count(&total).Error; e != nil {
+		if e := q.Count(&total).Error; e != nil {
 			return e
 		}
-		if e = q.Order(order).Offset(offset).Limit(limit).Find(&items).Error; e != nil {
+		if e := q.Order(order).Offset(offset).Limit(limit).Find(&items).Error; e != nil {
+			return e
+		}
+		activity, e := sourceActivities(tx, libraryID, items)
+		if e != nil {
 			return e
 		}
 		items = projectSourceActivity(items, activity)

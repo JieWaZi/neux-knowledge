@@ -152,6 +152,7 @@ func currentSchemaModels() []any {
 }
 
 var currentSchemaIndexes = map[string]string{
+	"idx_source_work_version_job": "CREATE INDEX idx_source_work_version_job ON knowledge_organize_source_work(source_version_id, library_id, job_id, job_attempt)",
 	"idx_source_library_created":  "CREATE INDEX idx_source_library_created ON knowledge_source_versions(library_id, created_at, id)",
 	"idx_source_identity_version": "CREATE UNIQUE INDEX idx_source_identity_version ON knowledge_source_versions(source_id, version)",
 	"idx_stage_job_created":       "CREATE INDEX idx_stage_job_created ON knowledge_stages(job_id, created_at, id)",

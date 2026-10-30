@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gorm.io/gorm"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
+	"gorm.io/gorm"
 )
 
 func sourceWorkFixture(t *testing.T, extraSources ...string) (*Store, *types.Library, *types.SourceVersion, *types.Job) {
@@ -54,6 +55,62 @@ func sourceWorkFixture(t *testing.T, extraSources ...string) (*Store, *types.Lib
 		t.Fatal(err)
 	}
 	return s, library, version, accepted
+}
+
+func TestSourcePageDoesNotMaterializeOtherQueuedJobs(t *testing.T) {
+	ctx := context.Background()
+	s, library, source, _ := sourceWorkFixture(t)
+	for index := 0; index < 32; index++ {
+		name := fmt.Sprintf("unused-%02d", index)
+		raw, err := s.ImportSource(ctx, types.ImportSourceInput{RequestID: name + "-raw", LibraryID: library.ID, Filename: name + ".md", Bytes: []byte(name)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.AcceptJob(ctx, types.AcceptJobInput{RequestID: name + "-job", LibraryID: library.ID, ExpectedVersion: library.Version, StructureVersion: library.StructureVersion, SourceVersionIDs: []string{raw.ResourceID}, Permission: types.PermissionSnapshot{PolicyVersion: library.PolicyVersion, Operations: []string{"organize"}}, RulesVersion: "rules", ConfigDigest: "config"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var materialized, sourceRows int64
+	if err := s.db.Callback().Query().After("gorm:query").Register("source-page-row-budget", func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil {
+			return
+		}
+		switch tx.Statement.Schema.Table {
+		case "knowledge_jobs", "knowledge_organize_source_work":
+			materialized += tx.RowsAffected
+		case "knowledge_source_versions":
+			sourceRows += tx.RowsAffected
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.Callback().Query().Remove("source-page-row-budget")
+	for _, state := range []string{"", "queued"} {
+		materialized, sourceRows = 0, 0
+		items, total, err := s.ListSourcesQuery(ctx, library.ID, types.SourceQuery{Query: "work.md", State: state, Limit: 1})
+		if err != nil || total != 1 || len(items) != 1 || !items[0].OrganizeBlocked || items[0].State != "queued" {
+			t.Fatalf("source page lost actual activity: items=%+v total=%d err=%v", items, total, err)
+		}
+		// 来源行最多包含 count 标量、当前页和当前页投影，不允许把其他版本带回 Go。
+		if materialized > 2 || sourceRows > 3 {
+			t.Fatalf("one-source page materialized unrelated queue state: jobs/work=%d sourceRows=%d", materialized, sourceRows)
+		}
+		t.Logf("state=%q jobs/work=%d sourceRows=%d", state, materialized, sourceRows)
+	}
+	materialized, sourceRows = 0, 0
+	items, total, err := s.ListSourcesQuery(ctx, library.ID, types.SourceQuery{State: "queued", Offset: 31, Limit: 1})
+	if err != nil || total != 33 || len(items) != 1 || items[0].State != "queued" || !items[0].OrganizeBlocked || materialized > 2 || sourceRows > 3 {
+		t.Fatalf("state count or page scope changed: items=%+v total=%d jobs/work=%d sourceRows=%d err=%v", items, total, materialized, sourceRows, err)
+	}
+	t.Logf("filtered total=%d page=%d jobs/work=%d sourceRows=%d", total, len(items), materialized, sourceRows)
+	materialized, sourceRows = 0, 0
+	items, err = s.SourceActivity(ctx, library.ID, []*types.SourceVersion{source})
+	if err != nil || len(items) != 1 || items[0].State != "queued" || !items[0].OrganizeBlocked || materialized > 2 || sourceRows > 1 {
+		t.Fatalf("direct projection escaped source scope: items=%+v jobs/work=%d sourceRows=%d err=%v", items, materialized, sourceRows, err)
+	}
+	t.Logf("direct projection jobs/work=%d sourceRows=%d", materialized, sourceRows)
+
 }
 
 func TestSourceWorkRetryBudgetUsesPersistentCASAndReceipts(t *testing.T) {
@@ -217,5 +274,116 @@ func TestTransactionAdmissionCanBeCancelled(t *testing.T) {
 	close(release)
 	if err := <-finished; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSourceActivityKeepsPersistentConclusionsAndCrossVersionReservations 覆盖取消中的任务、归档、当前尝试与旧版本占用。
+func TestSourceActivityKeepsPersistentConclusionsAndCrossVersionReservations(t *testing.T) {
+	ctx := context.Background()
+	s, library, old, job := sourceWorkFixture(t)
+	rec, err := s.ImportSource(ctx, types.ImportSourceInput{RequestID: "new-version", LibraryID: library.ID, SourceID: old.SourceID, ExpectedVersion: old.Version, Filename: old.Filename, Bytes: []byte("更新后的真实来源")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&types.Job{}).Where("id = ?", job.ID).Update("state", "cancel_requested").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Create(&types.OrganizeSourceWork{ID: "old-attempt", JobID: job.ID, JobAttempt: job.Attempt - 1, SourceVersionID: old.ID, State: "dead", Diagnostic: "旧尝试诊断", StartedAt: 10}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name       string // 当前持久事实场景。
+		rawState   string // 来源持久结论。
+		archived   bool   // 来源归档状态。
+		workState  string // 当前尝试的工作状态。
+		startedAt  int64  // 当前尝试是否已实际开始。
+		wantState  string // 请求范围中的最终展示状态。
+		diagnostic string // 应保留的当前诊断。
+	}{
+		{"waiting", "pending", false, "pending", 0, "queued", ""},
+		{"started", "failed", false, "pending", 10, "processing", ""},
+		{"cancel-retry", "cancelled", false, "pending", 0, "queued", ""},
+		{"processed", "processed", false, "pending", 0, "processed", "来源原诊断"},
+		{"no-change", "no-change", false, "pending", 0, "no-change", "来源原诊断"},
+		{"done", "failed", false, "done", 10, "failed", "来源原诊断"},
+		{"dead", "pending", false, "dead", 10, "failed", "当前尝试诊断"},
+		{"archived", "failed", true, "dead", 10, "failed", "来源原诊断"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.db.Model(&types.SourceVersion{}).Where("id = ?", old.ID).Updates(map[string]any{"state": tc.rawState, "archived": tc.archived, "diagnostic": "来源原诊断"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Model(&types.OrganizeSourceWork{}).Where("job_id = ? AND job_attempt = ?", job.ID, job.Attempt).Updates(map[string]any{"state": tc.workState, "started_at": tc.startedAt, "diagnostic": "当前尝试诊断"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			prior, err := s.GetSource(ctx, library.ID, old.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			latest, err := s.GetSource(ctx, library.ID, rec.ResourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			items, err := s.SourceActivity(ctx, library.ID, []*types.SourceVersion{prior, nil, latest})
+			if err != nil || len(items) != 2 || items[0].State != tc.wantState || items[0].Diagnostic != tc.diagnostic || !items[0].OrganizeBlocked || items[1].State != "pending" || !items[1].OrganizeBlocked || prior.State != tc.rawState {
+				t.Fatalf("cross-version activity changed: items=%+v prior=%+v err=%v", items, prior, err)
+			}
+			page, total, err := s.ListSourcesQuery(ctx, library.ID, types.SourceQuery{State: tc.wantState, Limit: 1})
+			want := int64(1)
+			if tc.archived {
+				want = 0
+			}
+			if err != nil || total != want || int64(len(page)) != want || (want > 0 && (page[0].ID != old.ID || page[0].State != tc.wantState || !page[0].OrganizeBlocked)) {
+				t.Fatalf("filtered count lost persistent state: total=%d want=%d page=%+v err=%v", total, want, page, err)
+			}
+		})
+	}
+	if err := s.db.Model(&types.Job{}).Where("id = ?", job.ID).Update("state", "cancelled").Error; err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.GetSource(ctx, library.ID, rec.ResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.SourceActivity(ctx, library.ID, []*types.SourceVersion{latest})
+	if err != nil || len(items) != 1 || items[0].OrganizeBlocked || items[0].State != "pending" {
+		t.Fatalf("terminal job retained reservation: items=%+v err=%v", items, err)
+	}
+}
+
+// TestSourceActivityQueryPlanUsesPersistentIndexes 核对当前尝试、来源身份及库范围沿现有索引查询，不增加连接或第二事实源。
+func TestSourceActivityQueryPlanUsesPersistentIndexes(t *testing.T) {
+	s, library, source, _ := sourceWorkFixture(t)
+	queries := []string{
+		"SELECT id, " + sourceActivityStateSQL() + ", " + sourceOccupiedSQL() + " FROM knowledge_source_versions WHERE library_id = ? AND id = ?",
+		"SELECT count(*) FROM knowledge_source_versions WHERE library_id = ? AND archived = false AND CASE WHEN state IN ('processed','no-change') THEN state ELSE COALESCE(NULLIF(" + sourceActivityStateSQL() + ", ''), state) END = ?",
+	}
+	for index, query := range queries {
+		args := []any{library.ID, source.ID}
+		if index == 1 {
+			args[1] = "queued"
+		}
+		var plan []struct {
+			ID     int    // 查询步骤标识。
+			Parent int    // 上级步骤标识。
+			Unused int    // SQLite 保留列。
+			Detail string // SQLite 实际查询计划。
+		}
+		if err := s.db.Raw("EXPLAIN QUERY PLAN "+query, args...).Scan(&plan).Error; err != nil {
+			t.Fatal(err)
+		}
+		details := []string{}
+		for _, step := range plan {
+			details = append(details, step.Detail)
+		}
+		text := strings.Join(details, " | ")
+		if strings.Contains(text, "json_each") || strings.Contains(text, "idx_knowledge_jobs_library_id") || strings.Contains(text, "SCAN source_work") {
+			t.Fatalf("source lookup scanned the library job membership: %s", text)
+		}
+		if !strings.Contains(text, "idx_source_work_version_job") || !strings.Contains(text, "sqlite_autoindex_knowledge_jobs_1") || (index == 0 && !strings.Contains(text, "idx_source_identity_version")) {
+			t.Fatalf("persistent lookup index missing: %s", text)
+		}
+		t.Logf("query=%d plan=%s", index, text)
 	}
 }

@@ -7,36 +7,53 @@ import (
 
 	types "github.com/JieWaZi/neux-knowledge/internal/domain"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
-// EnsureOrganizeSourceWork idempotently registers frozen sources for the current attempt without resetting the committed failure budget.
+// initializeOrganizeSourceWork 与接纳或重试共用原事务，当前尝试的冻结来源关系在 queued 时已完整持久化。
+func initializeOrganizeSourceWork(tx *gorm.DB, j *types.Job) error {
+	if types.IsMaintenanceJob(j) {
+		return nil
+	}
+	var sources []types.SourceVersion
+	if err := tx.Select("id, library_id, state").Where("id IN ?", j.SourceVersionIDs).Find(&sources).Error; err != nil {
+		return err
+	}
+	if len(sources) != len(j.SourceVersionIDs) {
+		return fail(types.ErrNotFound, "source.work.initialize", "frozen source identity is missing")
+	}
+	now := time.Now().UnixMilli()
+	work := make([]types.OrganizeSourceWork, 0, len(sources))
+	for _, source := range sources {
+		if source.LibraryID != j.LibraryID {
+			return fail(types.ErrScopeViolation, "source.work.initialize", "source belongs to another library")
+		}
+		state := "pending"
+		if source.State == "processed" || source.State == "no-change" {
+			state = "done"
+		}
+		work = append(work, types.OrganizeSourceWork{ID: newID(), LibraryID: j.LibraryID, JobID: j.ID, JobAttempt: j.Attempt, SourceVersionID: source.ID, State: state, Version: 1, CreatedAt: now, UpdatedAt: now})
+	}
+	return tx.CreateInBatches(work, 100).Error
+}
+
+// EnsureOrganizeSourceWork 核对接纳事务已登记的完整来源关系，不延迟补写或重置已提交的失败预算。
 func (s *Store) EnsureOrganizeSourceWork(ctx context.Context, jobID string) error {
 	return s.transaction(ctx, func(tx *gorm.DB) error {
 		j, _, err := activeJob(tx, jobID)
 		if err != nil {
 			return err
 		}
-		var sources []types.SourceVersion
-		if err = tx.Where("id IN ?", j.SourceVersionIDs).Find(&sources).Error; err != nil {
+		if types.IsMaintenanceJob(j) {
+			return nil
+		}
+		var count int64
+		if err := tx.Model(&types.OrganizeSourceWork{}).
+			Where("library_id = ? AND job_id = ? AND job_attempt = ? AND source_version_id IN ?", j.LibraryID, j.ID, j.Attempt, j.SourceVersionIDs).
+			Count(&count).Error; err != nil {
 			return err
 		}
-		if len(sources) != len(j.SourceVersionIDs) {
-			return fail(types.ErrNotFound, "source.work.ensure", "frozen source identity is missing")
-		}
-		for _, source := range sources {
-			if source.LibraryID != j.LibraryID {
-				return fail(types.ErrScopeViolation, "source.work.ensure", "source belongs to another library")
-			}
-			state := "pending"
-			if source.State == "processed" || source.State == "no-change" {
-				state = "done"
-			}
-			now := time.Now().UnixMilli()
-			work := types.OrganizeSourceWork{ID: newID(), LibraryID: j.LibraryID, JobID: j.ID, JobAttempt: j.Attempt, SourceVersionID: source.ID, State: state, Version: 1, CreatedAt: now, UpdatedAt: now}
-			if err = tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "job_id"}, {Name: "job_attempt"}, {Name: "source_version_id"}}, DoNothing: true}).Create(&work).Error; err != nil {
-				return err
-			}
+		if count != int64(len(j.SourceVersionIDs)) {
+			return fail(types.ErrNotFound, "source.work.ensure", "accepted source membership is incomplete")
 		}
 		return nil
 	})

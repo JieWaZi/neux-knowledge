@@ -123,9 +123,9 @@ func validateFrozenSources(tx *gorm.DB, j *types.Job) error {
 // ensureSourcesUnoccupied 在接纳事务中按原件身份去重，覆盖排队、执行中及不同版本。
 func ensureSourcesUnoccupied(tx *gorm.DB, j *types.Job) error {
 	var count int64
-	err := tx.Model(&types.Job{}).
-		Where("library_id = ? AND id <> ? AND state IN ?", j.LibraryID, j.ID, []string{"queued", "processing", "cancel_requested"}).
-		Where("EXISTS (SELECT 1 FROM json_each(source_version_ids) WHERE value IN (SELECT id FROM knowledge_source_versions WHERE library_id = ? AND source_id IN (SELECT source_id FROM knowledge_source_versions WHERE id IN ?)))", j.LibraryID, j.SourceVersionIDs).
+	err := tx.Model(&types.SourceVersion{}).
+		Where("library_id = ? AND id IN ?", j.LibraryID, j.SourceVersionIDs).
+		Where(sourceOccupiedSQL()).
 		Count(&count).Error
 	if err != nil {
 		return err
@@ -348,6 +348,9 @@ func (s *Store) AcceptJob(ctx context.Context, in types.AcceptJobInput) (*types.
 		if err = tx.Create(&j).Error; err != nil {
 			return nil, err
 		}
+		if err = initializeOrganizeSourceWork(tx, &j); err != nil {
+			return nil, err
+		}
 		return &types.Receipt{ResourceID: j.ID, JobID: j.ID, Version: j.Version, State: "accepted"}, nil
 	})
 }
@@ -472,6 +475,10 @@ func (s *Store) RetryJob(ctx context.Context, in types.JobActionInput) (*types.R
 		}
 		if r.RowsAffected != 1 {
 			return nil, fail(types.ErrVersionConflict, "job.retry", "job changed")
+		}
+		j.Attempt++
+		if err = initializeOrganizeSourceWork(tx, j); err != nil {
+			return nil, err
 		}
 		return &types.Receipt{LibraryID: l.ID, ResourceID: j.ID, JobID: j.ID, Version: j.Version + 1, State: "accepted"}, nil
 	})
