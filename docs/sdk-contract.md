@@ -70,7 +70,7 @@ Wiki 文档使用Pass0候选提取，失败时回退旧完整提取器；长文W
 
 ## 模型与检索边界
 
-核心向Generator保留原system/user/assistant消息顺序和正文。NeuxAlly的Codex独立文本适配使用临时原生主目录，只沿用认证与provider连接；原system正文通过model_instructions_file替换内置基础指令，原user正文直接发送。仅user调用因原生CLI要求基础指令非空，使用明确记录的中性适配句，不把它称为上游system。关闭AGENTS读取、内置skills与自动skills指令，清除模型目录的代码助手指令；普通Chat不走此路径。assistant续写历史及其他Runtime仍经ACP文本序列化，其限制明确诊断。原生权限/会话元数据和部分工具定义仍可能存在，Thinking、输出上限与温度是否可控以本次Diagnostics为准，不声称完整Chat API等价或内容质量已经等效。
+核心向 Generator 保留本次 system/user/assistant 消息的顺序与正文，由宿主实现的 Generator 负责模型调用及结果适配。CLI 选择、原生配置加载、工具调用和进程生命周期归宿主，知识核心不创建聊天或持有原生会话。核心只消费最终正文与真实停止原因；消息角色、Thinking、输出上限与温度的实际支持程度由本次 Diagnostics 说明。
 
 Wiki-only不要求Embedding。固定上游的vector与keyword都调用检索引擎BatchIndex，二者均要求Embedding；本地vector要求Embedding，keyword使用SQLite关键词分支，因此不要求Embedding。GraphEnabled对应上游独立实体关系抽取，不是Wiki页面出链和反链；本地未接入实体关系抽取。Wiki出链来自正文wikilink及上游Finalize标题匹配，反链由出链投影；生产Finalize不匹配新页别名，也不把不相干全文强行链接。
 
