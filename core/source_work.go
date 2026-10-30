@@ -15,7 +15,7 @@ type SourceWorkActionInput = types.SourceWorkActionInput
 // ErrSourceUnavailable means a frozen source is inactive and can be settled per document; it does not indicate authorization revocation.
 const ErrSourceUnavailable = types.ErrSourceUnavailable
 
-// EnsureOrganizeSourceWork idempotently registers frozen sources for the current job attempt.
+// EnsureOrganizeSourceWork 核对当前尝试已在接纳事务中完整登记的来源关系。
 func (e *Engine) EnsureOrganizeSourceWork(ctx context.Context, jobID string) error {
 	return e.store.EnsureOrganizeSourceWork(ctx, jobID)
 }

@@ -82,3 +82,43 @@ func TestCurrentSchemaRejectsDifferentVersionWithoutRewritingIt(t *testing.T) {
 		t.Fatal("different schema version was accepted")
 	}
 }
+
+// TestCurrentSourceWorkSchemaRequiresReverseIndex 验证新库生成完整工作表及反查索引，缺失时严格拒开且不自动修补。
+func TestCurrentSourceWorkSchemaRequiresReverseIndex(t *testing.T) {
+	ctx := context.Background()
+	s, databasePath, rawPath, _ := auditStore(t)
+	var ddl []struct {
+		Name string // 当前工作表或索引名称。
+		SQL  string // SQLite 实际保存的建表或建索引定义。
+	}
+	if err := s.db.Raw("SELECT name,sql FROM sqlite_master WHERE tbl_name='knowledge_organize_source_work' AND sql IS NOT NULL ORDER BY type DESC,name").Scan(&ddl).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range ddl {
+		t.Logf("%s: %s", entry.Name, entry.SQL)
+	}
+	var columns []string
+	if err := s.db.Raw("SELECT name FROM pragma_index_info('idx_source_work_version_job') ORDER BY seqno").Scan(&columns).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 4 || columns[0] != "source_version_id" || columns[1] != "library_id" || columns[2] != "job_id" || columns[3] != "job_attempt" {
+		t.Fatalf("reverse lookup does not start with the requested source scope: %v", columns)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, databasePath, rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.Exec("DROP INDEX idx_source_work_version_job").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if mismatched, err := Open(ctx, databasePath, rawPath); err == nil {
+		mismatched.Close()
+		t.Fatal("schema without the current reverse index was accepted or silently repaired")
+	}
+}

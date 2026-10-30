@@ -147,7 +147,7 @@ func TestJobQueueTerminalSourceDisplayStillReportsReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err = db.Exec("INSERT INTO knowledge_organize_source_work (id,library_id,job_id,job_attempt,source_version_id,state,diagnostic) VALUES (?,?,?,?,?,'dead','failed in this attempt')", "dead-work", lib.ID, accepted.JobID, 1, first.ID); err != nil {
+	if _, err = db.Exec("UPDATE knowledge_organize_source_work SET state='dead',diagnostic='failed in this attempt' WHERE library_id=? AND job_id=? AND job_attempt=? AND source_version_id=?", lib.ID, accepted.JobID, 1, first.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec("UPDATE knowledge_source_versions SET state='failed' WHERE id=?", first.ID); err != nil {
